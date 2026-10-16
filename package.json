@@ -1,0 +1,12 @@
+{
+  "name": "cf-ai-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Commercial AI Telegram bot on Cloudflare Workers (Workers AI + D1)",
+  "scripts": {
+    "setup": "node setup.mjs",
+    "test": "node test/worker.test.mjs && node test/setup.test.mjs"
+  },
+  "engines": { "node": ">=18" }
+}
