@@ -4,8 +4,8 @@
 import { Env, eitaaWeb } from "./env";
 import { normDigits } from "./util";
 
-export interface SrcMsg { source: string; id: string; text: string; ts: number | null; image: string; video: boolean; sticker: boolean }
-export interface FetchResult { ok: boolean; status: number; messages: SrcMsg[]; title: string; note: string; snippet: string }
+export interface SrcMsg { source: string; id: string; text: string; ts: number | null; image: string; video: boolean; videoUrl: string; sticker: boolean }
+export interface FetchResult { ok: boolean; status: number; messages: SrcMsg[]; title: string; note: string; snippet: string; hint?: string }
 
 const ENT: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", laquo: "«", raquo: "»", hellip: "…", zwnj: "‌" };
 export const unescapeHtml = (s: string): string =>
@@ -45,25 +45,47 @@ export function parseMessages(html: string, source: string, base: string): SrcMs
     while ((tm = tre.exec(block))) if (!/reply/.test(tm[1])) text = htmlToText(tm[2]);
     const dt = block.match(/<time[^>]+datetime=["']([^"']+)["']/i);
     const ts = dt && !isNaN(Date.parse(dt[1])) ? Math.floor(Date.parse(dt[1]) / 1000) : null;
-    let image = "";
-    const pm = block.match(/class=["'][^"']*photo_wrap[^"']*["'][^>]*background-image:\s*url\(\s*['"&quot;]*([^'")]+?)['"&quot;]*\s*\)/i)
-      || block.match(/background-image:\s*url\(\s*['"&quot;]*([^'")]+?)['"&quot;]*\s*\)[^>]*class=["'][^"']*photo_wrap/i)
-      || block.match(/<img[^>]+class=["'][^"']*photo[^"']*["'][^>]+src=["']([^"']+)["']/i);
-    if (pm) image = abs(pm[1]);
+    const bgOf = (tag: string) => { const m = tag.match(/background-image:\s*url\(\s*(?:&quot;|&#0?39;|['"])?([^'")&]+(?:&amp;[^'")&]+)*)(?:&quot;|&#0?39;|['"])?\s*\)/i); return m ? m[1] : ""; };
+    const cls = (tag: string) => (tag.match(/class=["']([^"']*)["']/i) || ["", ""])[1];
+    // every tag that carries a background image / <img>, classified by its class name
+    let image = "", thumb = "", videoUrl = "";
+    for (const tm2 of block.matchAll(/<(a|div|i|span|img|video|source)\b[^>]*>/gi)) {
+      const tag = tm2[0], c = cls(tag);
+      if (/user_photo|userpic|avatar|_via|link_preview_site|emoji/i.test(c)) continue;
+      if (tm2[1].toLowerCase() === "video" || tm2[1].toLowerCase() === "source") {
+        const src = tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i);
+        if (src && !videoUrl && (tm2[1].toLowerCase() === "video" || /video|mp4|webm|mov/i.test(src[1] + tag))) videoUrl = abs(src[1]);
+        const poster = tag.match(/\sposter=["']([^"']+)["']/i);
+        if (poster && !thumb) thumb = abs(poster[1]);
+        continue;
+      }
+      if (/video/i.test(c) && /thumb|wrap|player|_video/i.test(c)) { const u = bgOf(tag) || (tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i) || [])[1] || ""; if (u && !thumb) thumb = abs(u); const dv = tag.match(/data-(?:video|src|href)=["']([^"']+\.(?:mp4|webm|mov)[^"']*)["']/i); if (dv && !videoUrl) videoUrl = abs(dv[1]); continue; }
+      if (/photo|image|pic|_media|grouped/i.test(c) && !/sticker/i.test(c)) {
+        const u = bgOf(tag) || (tm2[1].toLowerCase() === "img" ? (tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i) || [])[1] || "" : "");
+        if (u && !image) image = abs(u);
+      }
+    }
+    if (!image && !videoUrl && !thumb) {      // last resort: the first background image of the message that is not a sticker / avatar
+      for (const tag of block.matchAll(/<[^>]+background-image[^>]*>/gi)) {
+        if (/user_photo|avatar|sticker/i.test(cls(tag[0]))) continue;
+        const u = bgOf(tag[0]); if (u) { image = abs(u); break; }
+      }
+    }
     // stickers: the static .webp is in data-webp (or the background image of the *_sticker element)
     let sticker = false;
-    if (!image) {
+    if (!image && !videoUrl && !thumb) {
       const wp = block.match(/data-webp=["']([^"']+)["']/i);
       let su = wp ? wp[1] : "";
       if (!su) for (const tag of block.matchAll(/<[^>]+class=["'][^"']*_sticker[^"']*["'][^>]*>/gi)) {
-        const bg = tag[0].match(/background-image:\s*url\(\s*['"&quot;]*([^'")]+?)['"&quot;]*\s*\)/i) || tag[0].match(/(?:src|data-src)=["']([^"']+\.webp[^"']*)["']/i);
-        if (bg) { su = bg[1]; break; }
+        const bg = bgOf(tag[0]) || (tag[0].match(/(?:src|data-src)=["']([^"']+\.webp[^"']*)["']/i) || [])[1];
+        if (bg) { su = bg; break; }
       }
       if (su) { image = abs(su); sticker = true; }
     }
-    const video = /_widget_message_video|<video[\s>]/i.test(block);
-    if (!text && !image) continue;
-    out.push({ source, id, text, ts, image, video, sticker });
+    const video = !!videoUrl || /_widget_message_video|<video[\s>]|video_thumb|round_video/i.test(block);
+    if (video && !image) image = thumb;       // a video we cannot download (no src) is still shown through its thumbnail
+    if (!text && !image && !videoUrl) continue;
+    out.push({ source, id, text, ts, image, video, videoUrl, sticker });
   }
   return out;
 }
@@ -93,6 +115,7 @@ export async function fetchChannel(env: Env, source: string): Promise<FetchResul
       const messages = parseMessages(html, name, base);
       last = { ok: messages.length > 0, status, messages, title: pageTitle(html),
         note: messages.length ? "" : "صفحه باز شد ولی پیامی در آن شناسایی نشد (کانال عمومی نیست یا ساختار صفحه فرق دارد)",
+        hint: `background-image:${(html.match(/background-image/gi) || []).length} video:${(html.match(/<video/gi) || []).length} img:${(html.match(/<img/gi) || []).length}`,
         snippet: htmlToText(html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")).slice(0, 400) };
       if (messages.length) return last;
     } catch (e) { last = { ...last, note: `خطای شبکه: ${(e as Error).message}` }; }
@@ -103,11 +126,11 @@ export async function fetchChannel(env: Env, source: string): Promise<FetchResul
 /** Download an image (or small file) from a URL with a size cap. */
 export async function fetchBytes(url: string, maxBytes: number, referer?: string): Promise<{ bytes: Uint8Array; type: string }> {
   const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (compatible; MedyasBot/1.0)", ...(referer ? { referer } : {}) }, redirect: "follow" });
-  if (!r.ok) throw new Error(`دانلود تصویر منبع ناموفق بود (HTTP ${r.status})`);
+  if (!r.ok) throw new Error(`دانلود فایل منبع ناموفق بود (HTTP ${r.status})`);
   const len = parseInt(r.headers.get("content-length") || "0", 10);
-  if (len > maxBytes) throw new Error("حجم تصویر منبع زیاد است");
+  if (len > maxBytes) throw new Error("حجم فایل منبع زیاد است");
   const buf = new Uint8Array(await r.arrayBuffer());
-  if (buf.length > maxBytes) throw new Error("حجم تصویر منبع زیاد است");
+  if (buf.length > maxBytes) throw new Error("حجم فایل منبع زیاد است");
   return { bytes: buf, type: r.headers.get("content-type") || "" };
 }
 export const extFor = (type: string, url: string): string => {

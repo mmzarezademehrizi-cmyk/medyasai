@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import worker from '../src/index.js';
+import { parseMessages, resolvePost } from '../src/eitaa.js';
 
 // ---------- D1 mock ----------
 function makeD1() {
@@ -35,6 +36,15 @@ const BING_HTML = `<ol><li class="b_algo"><h2><a href="https://www.bing.com/ck/a
 const PAGE_HTML = `<html><head><title>My Article</title><style>.x{}</style></head><body><nav>menu</nav><article><h1>Heading</h1><p>${'Hello world. '.repeat(120)}</p><script>var x=1</script></article><footer>foot</footer></body></html>`;
 const TINY_JPEG_B64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5, 0xff, 0xd9]).toString('base64');
 
+const NOW_ISO = new Date().toISOString();
+const msgHtml = (id, inner, text) => `<div class="etme_widget_message_wrap"><div class="etme_widget_message" data-post="srcchan/${id}">${inner}${text ? `<div class="etme_widget_message_text js-message_text">${text}</div>` : ''}<span class="etme_widget_message_meta"><time datetime="${NOW_ISO}">x</time></span></div></div>`;
+const SRC_PAGE = '<html><head><title>Src - Eitaa</title></head><body>' +
+  msgHtml(1, '', 'فقط متن ساده برای تست') +
+  msgHtml(2, `<a class="etme_widget_message_photo_wrap" href="https://eitaa.com/srcchan/2" style="width:453px;background-image:url('https://cdn.eitaa.test/p2.jpg')"></a>`, 'عکس خبر ورزشی امروز\n🆔 @srcchan') +
+  msgHtml(3, `<div class="etme_widget_message_video_player"><a class="etme_widget_message_video_wrap"><video src="https://cdn.eitaa.test/v3.mp4" class="etme_widget_message_video js-message_video" poster="https://cdn.eitaa.test/t3.jpg"></video></a></div>`, 'ویدیوی ورزشی') +
+  msgHtml(4, `<a class="etme_widget_message_video_thumb" style="background-image:url('https://cdn.eitaa.test/t4.jpg')"></a>`, 'ویدیوی بزرگ بدون لینک') +
+  '</body></html>';
+
 // ---------- global mocks ----------
 let tgCalls = [];
 let ddgMode = 'ok'; // ok | empty
@@ -61,6 +71,8 @@ globalThis.fetch = async (url, init = {}) => {
     if (method === 'getMe') return Response.json({ ok: true, result: { username: 'acc_eitaa' } });
     return Response.json({ ok: true, result: { message_id: 77 } });
   }
+  if (url === 'https://eitaa.com/srcchan') return new Response(SRC_PAGE, { headers: { 'content-type': 'text/html' } });
+  if (url.startsWith('https://cdn.eitaa.test/')) return new Response(new Uint8Array(url.endsWith('.mp4') ? 5000 : 3000).fill(7), { headers: { 'content-type': url.endsWith('.mp4') ? 'video/mp4' : 'image/jpeg' } });
   if (url.startsWith('https://eitaa.com')) return new Response('busy', { status: 503 });
   if (url.startsWith('https://html.duckduckgo.com')) return new Response(ddgMode === 'ok' ? DDG_HTML : '<html>anomaly</html>');
   if (url.startsWith('https://www.bing.com/search')) return new Response(BING_HTML);
@@ -499,6 +511,65 @@ test('ایتا: توکن، کانال، پست زمان‌بندی، ایجنت�
   await run();                                          // تیک بعدی پست آماده را تحویل می‌دهد
   assert.equal(dbq('SELECT status s FROM ea_posts WHERE id=?', posts[0].id)[0].s, 'sent');
   assert.ok(eitaaCalls.some((c) => c.method === 'sendMessage' && String(c.form.text).startsWith('روز خوش')));
+});
+
+test('ایتا: خواندن عکس و ویدیو از صفحه‌ی کانال منبع', async () => {
+  const m = parseMessages(SRC_PAGE, 'srcchan', 'https://eitaa.com');
+  assert.equal(m.length, 4);
+  assert.equal(m[0].image, '');
+  assert.equal(m[1].image, 'https://cdn.eitaa.test/p2.jpg');
+  assert.equal(m[2].videoUrl, 'https://cdn.eitaa.test/v3.mp4');
+  assert.equal(m[2].video, true);
+  assert.equal(m[3].videoUrl, '');
+  assert.equal(m[3].video, true);
+  assert.equal(m[3].image, 'https://cdn.eitaa.test/t4.jpg');
+});
+
+test('ایتا: from_ref خودکار عکس/ویدیو را هم همراه می‌آورد', async () => {
+  const st = { refs: new Map([
+    ['c/1', { text: 'متن', image: '', sticker: false, video: '', hasVideo: false }],
+    ['c/2', { text: 'عکس', image: 'https://x/p.jpg', sticker: false, video: '', hasVideo: false }],
+    ['c/3', { text: 'ویدیو', image: 'https://x/t.jpg', sticker: false, video: 'https://x/v.mp4', hasVideo: true }],
+    ['c/4', { text: '', image: 'https://x/s.webp', sticker: true, video: '', hasVideo: false }],
+    ['c/5', { text: 'ب'.repeat(1200), image: 'https://x/p.jpg', sticker: false, video: '', hasVideo: false }],
+  ]) };
+  assert.equal(resolvePost(st, { from_ref: 'c/1' }, 'امضا').kind, 'none');
+  const img = resolvePost(st, { from_ref: 'c/2' }, 'امضا');
+  assert.equal(img.kind, 'image'); assert.equal(img.media, 'https://x/p.jpg'); assert.ok(img.text.endsWith('امضا'));
+  const vid = resolvePost(st, { from_ref: 'c/3' }, 'امضا');
+  assert.equal(vid.kind, 'video'); assert.equal(vid.media, 'https://x/v.mp4');
+  const stk = resolvePost(st, { image_ref: 'c/4' }, 'امضا');
+  assert.equal(stk.kind, 'sticker'); assert.equal(stk.text, '');
+  assert.equal(resolvePost(st, { from_ref: 'c/5' }, '').overflow, true);
+});
+
+test('ایتا: ایجنت پست عکس‌دار و ویدیویی را با رسانه به کانال می‌فرستد', async () => {
+  reset(); eitaaCalls.length = 0;
+  const chId = dbq('SELECT id FROM ea_channels WHERE user_id=1000')[0].id;
+  env.DB.raw.prepare('DELETE FROM agent_seen').run();
+  env.DB.raw.prepare("INSERT INTO agent_jobs(user_id,channel_id,name,instruction,times,footer,approve,enabled,run_now,last_key,attempts,created_at) VALUES(1000,?,'m','از @srcchan دو مطلب ورزشی بیاور','[]','🆔 @mychannel',0,1,1,'',0,0)").run(chId);
+  const call = (id, args) => ({ choices: [{ message: { content: '', tool_calls: [{ id, type: 'function', function: { name: 'post_to_channel', arguments: JSON.stringify(args) } }] } }] });
+  aiQueue.push({ choices: [{ message: { content: '', tool_calls: [{ id: 'r', type: 'function', function: { name: 'read_channel', arguments: JSON.stringify({ channel: 'srcchan' }) } }] } }] });
+  aiQueue.push((model, input) => {
+    const out = JSON.parse(input.messages.filter((x) => x.role === 'tool').pop().content);
+    const photo = out.posts.find((p) => p.image), video = out.posts.find((p) => p.video);
+    assert.ok(photo && video, JSON.stringify(out));
+    return { choices: [{ message: { content: '', tool_calls: [
+      { id: 'p1', type: 'function', function: { name: 'post_to_channel', arguments: JSON.stringify({ from_ref: photo.ref }) } },
+      { id: 'p2', type: 'function', function: { name: 'post_to_channel', arguments: JSON.stringify({ from_ref: video.ref }) } }] } }] };   // بدون image_ref / video_ref
+  });
+  const run = async () => { const w = []; await worker.scheduled({}, env, { waitUntil: (p) => w.push(p) }); await Promise.all(w); };
+  await run();
+  const posts = dbq("SELECT * FROM ea_posts WHERE job_id IS NOT NULL AND src_url!='' ORDER BY id");
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].src_url, 'https://cdn.eitaa.test/p2.jpg');
+  assert.equal(posts[1].src_url, 'https://cdn.eitaa.test/v3.mp4');
+  assert.ok(posts.every((p) => p.kind === 'file' && p.text.endsWith('🆔 @mychannel') && !p.text.includes('@srcchan')));
+  env.DB.raw.prepare("UPDATE ea_posts SET run_at=0 WHERE job_id IS NOT NULL").run();
+  await run();
+  const files = eitaaCalls.filter((c) => c.method === 'sendFile');
+  assert.equal(files.length, 2, JSON.stringify(eitaaCalls.map((c) => c.method)));
+  assert.ok(String(files[0].form.caption).includes('عکس خبر'));
 });
 
 // ---------- اجرا ----------

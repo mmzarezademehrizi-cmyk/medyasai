@@ -10,12 +10,14 @@ import { esc, fmtDt } from "./util";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_IMG = 15 * 1024 * 1024;
+const MAX_VIDEO = 45 * 1024 * 1024;   // Worker memory is 128 MB; larger videos fail with a clear message
 
 /** Posts made by the agent carry `src_url` (an image on the source channel's CDN); the rest come from Telegram files. */
 async function fileBytes(env: Env, p: PostRow): Promise<{ bytes: Uint8Array; name: string }> {
   if (p.src_url) {
-    const f = await fetchBytes(p.src_url, MAX_IMG, eitaaWeb(env) + "/");
-    return { bytes: f.bytes, name: p.file_name || `image.${extFor(f.type, p.src_url)}` };
+    const isVideo = /\.(mp4|mov|webm|mkv)$/i.test(p.file_name) || /\.(mp4|mov|webm)(\?|$)/i.test(p.src_url);
+    const f = await fetchBytes(p.src_url, isVideo ? MAX_VIDEO : MAX_IMG, eitaaWeb(env) + "/");
+    return { bytes: f.bytes, name: isVideo ? (p.file_name || "video.mp4") : p.file_name || `image.${extFor(f.type, p.src_url)}` };
   }
   return { bytes: await tg.download(env, p.file_id), name: p.file_name || "file" };
 }
@@ -24,7 +26,18 @@ async function sendOnce(env: Env, token: string, p: PostRow, ch: ChannelRow): Pr
   const o: eitaa.PostOpts = { title: p.title || undefined, silent: !!p.silent, pin: !!p.pin, viewDelete: p.view_delete || undefined };
   let res: any;
   if (p.kind === "text") res = await eitaa.sendMessage(env, token, ch.chat_id, p.text, o);
-  else { const f = await fileBytes(env, p); res = await eitaa.sendFile(env, token, ch.chat_id, f.name, f.bytes, p.text, o); }
+  else {
+    let f: { bytes: Uint8Array; name: string };
+    try { f = await fileBytes(env, p); }
+    catch (e) {
+      if (!p.src_url || !p.text) throw e;     // source media not downloadable: still publish the text and tell the owner
+      await tg.send(env, p.user_id, `⚠️ رسانه‌ی پست #${p.id} دانلود نشد (${esc((e as Error).message)}) و فقط متن ارسال شد.`);
+      res = await eitaa.sendMessage(env, token, ch.chat_id, p.text, o);
+      const id0 = res && (res.message_id ?? res.id ?? res.result?.message_id);
+      return id0 ? String(id0) : "";
+    }
+    res = await eitaa.sendFile(env, token, ch.chat_id, f.name, f.bytes, p.text, o);
+  }
   const id = res && (res.message_id ?? res.id ?? res.result?.message_id);
   return id ? String(id) : "";
 }

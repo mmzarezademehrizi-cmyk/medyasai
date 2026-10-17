@@ -497,17 +497,52 @@ function parseMessages(html, source, base) {
     while (tm = tre.exec(block)) if (!/reply/.test(tm[1])) text = htmlToText(tm[2]);
     const dt = block.match(/<time[^>]+datetime=["']([^"']+)["']/i);
     const ts = dt && !isNaN(Date.parse(dt[1])) ? Math.floor(Date.parse(dt[1]) / 1e3) : null;
-    let image = "";
-    const pm = block.match(/class=["'][^"']*photo_wrap[^"']*["'][^>]*background-image:\s*url\(\s*['"&quot;]*([^'")]+?)['"&quot;]*\s*\)/i) || block.match(/background-image:\s*url\(\s*['"&quot;]*([^'")]+?)['"&quot;]*\s*\)[^>]*class=["'][^"']*photo_wrap/i) || block.match(/<img[^>]+class=["'][^"']*photo[^"']*["'][^>]+src=["']([^"']+)["']/i);
-    if (pm) image = abs(pm[1]);
+    const bgOf = (tag) => {
+      const m2 = tag.match(/background-image:\s*url\(\s*(?:&quot;|&#0?39;|['"])?([^'")&]+(?:&amp;[^'")&]+)*)(?:&quot;|&#0?39;|['"])?\s*\)/i);
+      return m2 ? m2[1] : "";
+    };
+    const cls = (tag) => (tag.match(/class=["']([^"']*)["']/i) || ["", ""])[1];
+    let image = "", thumb = "", videoUrl = "";
+    for (const tm2 of block.matchAll(/<(a|div|i|span|img|video|source)\b[^>]*>/gi)) {
+      const tag = tm2[0], c = cls(tag);
+      if (/user_photo|userpic|avatar|_via|link_preview_site|emoji/i.test(c)) continue;
+      if (tm2[1].toLowerCase() === "video" || tm2[1].toLowerCase() === "source") {
+        const src = tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i);
+        if (src && !videoUrl && (tm2[1].toLowerCase() === "video" || /video|mp4|webm|mov/i.test(src[1] + tag))) videoUrl = abs(src[1]);
+        const poster = tag.match(/\sposter=["']([^"']+)["']/i);
+        if (poster && !thumb) thumb = abs(poster[1]);
+        continue;
+      }
+      if (/video/i.test(c) && /thumb|wrap|player|_video/i.test(c)) {
+        const u = bgOf(tag) || (tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i) || [])[1] || "";
+        if (u && !thumb) thumb = abs(u);
+        const dv = tag.match(/data-(?:video|src|href)=["']([^"']+\.(?:mp4|webm|mov)[^"']*)["']/i);
+        if (dv && !videoUrl) videoUrl = abs(dv[1]);
+        continue;
+      }
+      if (/photo|image|pic|_media|grouped/i.test(c) && !/sticker/i.test(c)) {
+        const u = bgOf(tag) || (tm2[1].toLowerCase() === "img" ? (tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i) || [])[1] || "" : "");
+        if (u && !image) image = abs(u);
+      }
+    }
+    if (!image && !videoUrl && !thumb) {
+      for (const tag of block.matchAll(/<[^>]+background-image[^>]*>/gi)) {
+        if (/user_photo|avatar|sticker/i.test(cls(tag[0]))) continue;
+        const u = bgOf(tag[0]);
+        if (u) {
+          image = abs(u);
+          break;
+        }
+      }
+    }
     let sticker = false;
-    if (!image) {
+    if (!image && !videoUrl && !thumb) {
       const wp = block.match(/data-webp=["']([^"']+)["']/i);
       let su = wp ? wp[1] : "";
       if (!su) for (const tag of block.matchAll(/<[^>]+class=["'][^"']*_sticker[^"']*["'][^>]*>/gi)) {
-        const bg = tag[0].match(/background-image:\s*url\(\s*['"&quot;]*([^'")]+?)['"&quot;]*\s*\)/i) || tag[0].match(/(?:src|data-src)=["']([^"']+\.webp[^"']*)["']/i);
+        const bg = bgOf(tag[0]) || (tag[0].match(/(?:src|data-src)=["']([^"']+\.webp[^"']*)["']/i) || [])[1];
         if (bg) {
-          su = bg[1];
+          su = bg;
           break;
         }
       }
@@ -516,9 +551,10 @@ function parseMessages(html, source, base) {
         sticker = true;
       }
     }
-    const video = /_widget_message_video|<video[\s>]/i.test(block);
-    if (!text && !image) continue;
-    out.push({ source, id, text, ts, image, video, sticker });
+    const video = !!videoUrl || /_widget_message_video|<video[\s>]|video_thumb|round_video/i.test(block);
+    if (video && !image) image = thumb;
+    if (!text && !image && !videoUrl) continue;
+    out.push({ source, id, text, ts, image, video, videoUrl, sticker });
   }
   return out;
 }
@@ -557,6 +593,7 @@ async function fetchChannel(env, source) {
         messages,
         title: pageTitle(html),
         note: messages.length ? "" : "\u0635\u0641\u062D\u0647 \u0628\u0627\u0632 \u0634\u062F \u0648\u0644\u06CC \u067E\u06CC\u0627\u0645\u06CC \u062F\u0631 \u0622\u0646 \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC \u0646\u0634\u062F (\u06A9\u0627\u0646\u0627\u0644 \u0639\u0645\u0648\u0645\u06CC \u0646\u06CC\u0633\u062A \u06CC\u0627 \u0633\u0627\u062E\u062A\u0627\u0631 \u0635\u0641\u062D\u0647 \u0641\u0631\u0642 \u062F\u0627\u0631\u062F)",
+        hint: `background-image:${(html.match(/background-image/gi) || []).length} video:${(html.match(/<video/gi) || []).length} img:${(html.match(/<img/gi) || []).length}`,
         snippet: htmlToText(html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")).slice(0, 400)
       };
       if (messages.length) return last;
@@ -568,11 +605,11 @@ async function fetchChannel(env, source) {
 }
 async function fetchBytes(url, maxBytes, referer) {
   const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (compatible; MedyasBot/1.0)", ...referer ? { referer } : {} }, redirect: "follow" });
-  if (!r.ok) throw new Error(`\u062F\u0627\u0646\u0644\u0648\u062F \u062A\u0635\u0648\u06CC\u0631 \u0645\u0646\u0628\u0639 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062F (HTTP ${r.status})`);
+  if (!r.ok) throw new Error(`\u062F\u0627\u0646\u0644\u0648\u062F \u0641\u0627\u06CC\u0644 \u0645\u0646\u0628\u0639 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062F (HTTP ${r.status})`);
   const len = parseInt(r.headers.get("content-length") || "0", 10);
-  if (len > maxBytes) throw new Error("\u062D\u062C\u0645 \u062A\u0635\u0648\u06CC\u0631 \u0645\u0646\u0628\u0639 \u0632\u06CC\u0627\u062F \u0627\u0633\u062A");
+  if (len > maxBytes) throw new Error("\u062D\u062C\u0645 \u0641\u0627\u06CC\u0644 \u0645\u0646\u0628\u0639 \u0632\u06CC\u0627\u062F \u0627\u0633\u062A");
   const buf = new Uint8Array(await r.arrayBuffer());
-  if (buf.length > maxBytes) throw new Error("\u062D\u062C\u0645 \u062A\u0635\u0648\u06CC\u0631 \u0645\u0646\u0628\u0639 \u0632\u06CC\u0627\u062F \u0627\u0633\u062A");
+  if (buf.length > maxBytes) throw new Error("\u062D\u062C\u0645 \u0641\u0627\u06CC\u0644 \u0645\u0646\u0628\u0639 \u0632\u06CC\u0627\u062F \u0627\u0633\u062A");
   return { bytes: buf, type: r.headers.get("content-type") || "" };
 }
 var extFor = (type, url) => {
@@ -812,42 +849,66 @@ async function readChannel(env, st, a, jobId, maxChannels) {
       continue;
     }
     const text = cleanText(m.text, cid, r.title);
-    st.refs.set(ref, { image: m.image, text, sticker: m.sticker });
+    st.refs.set(ref, { image: m.image, text, sticker: m.sticker, video: m.videoUrl, hasVideo: m.video });
     if (posts.length >= limit) continue;
     const d = m.ts ? toLocal(m.ts) : null;
-    posts.push({ ref, ...d ? { date: `${d.y}-${pad2(d.mo)}-${pad2(d.d)} ${pad2(d.h)}:${pad2(d.mi)}` } : {}, text: text.slice(0, cut) + (text.length > cut ? "\u2026" : ""), ...m.image && !m.sticker ? { image: 1 } : {}, ...m.sticker ? { sticker: 1 } : {} });
+    posts.push({ ref, ...d ? { date: `${d.y}-${pad2(d.mo)}-${pad2(d.d)} ${pad2(d.h)}:${pad2(d.mi)}` } : {}, text: text.slice(0, cut) + (text.length > cut ? "\u2026" : ""), ...m.videoUrl ? { video: 1 } : m.video ? { video_thumb_only: 1 } : m.image && !m.sticker ? { image: 1 } : {}, ...m.sticker ? { sticker: 1 } : {} });
   }
   return { channel: cid, posts, ...hidden ? { hidden_old_or_used: hidden } : {} };
 }
 function resolvePost(st, a, footer) {
   let text = String(a.text || "").trim();
-  const fromRef = a.from_ref ? String(a.from_ref) : "", imageRef = a.image_ref ? String(a.image_ref) : "";
-  if (fromRef && !text) {
-    const r = st.refs.get(fromRef);
-    if (!r) return { error: "unknown from_ref (use a ref from read_channel)" };
-    text = r.text;
-  }
-  const ri = imageRef ? st.refs.get(imageRef) : void 0;
-  if (imageRef && !ri?.image) return { error: "image_ref has no image/sticker" };
-  const sticker = !!ri?.sticker;
-  if (sticker) text = "";
-  if (!text && !ri) return { error: "empty post" };
+  const fromRef = a.from_ref ? String(a.from_ref) : "", imageRef = a.image_ref ? String(a.image_ref) : "", videoRef = a.video_ref ? String(a.video_ref) : "";
+  const src = fromRef ? st.refs.get(fromRef) : void 0;
+  if (fromRef && !src) return { error: "unknown from_ref (use a ref from read_channel)" };
+  if (fromRef && !text) text = src.text;
+  let media = "", kind = "none";
+  const take = (ref) => {
+    const r = st.refs.get(ref);
+    if (!r) return false;
+    if (r.video) {
+      media = r.video;
+      kind = "video";
+      return true;
+    }
+    if (r.image) {
+      media = r.image;
+      kind = r.sticker ? "sticker" : "image";
+      return true;
+    }
+    return false;
+  };
+  if (videoRef && !take(videoRef)) return { error: "video_ref has no downloadable video" };
+  if (!media && imageRef && !take(imageRef)) return { error: "image_ref has no image/sticker" };
+  if (!media && fromRef) take(fromRef);
+  if (kind === "sticker") text = "";
+  if (!text && !media) return { error: "empty post" };
   const full = text ? text + (footer ? `
 
 ${footer}` : "") : "";
-  if (ri && !sticker && full.length > 1e3) return { error: "text+signature too long for a post with image (max 1000 chars): shorten or drop image_ref" };
   if (full.length > 3900) return { error: "text too long (max ~3900)" };
-  return { text: full, image: ri?.image || "", sticker, refs: [fromRef, imageRef].filter(Boolean) };
+  return { text: full, media, kind, refs: [fromRef, imageRef, videoRef].filter(Boolean), overflow: !!media && kind !== "sticker" && full.length > 1e3 };
+}
+var MEDIA_NAME = { sticker: "sticker.webp", video: "video.mp4", image: "", none: "" };
+async function insertResolved(env, b, p) {
+  const ins = async (kind, text, name, src, runAt, link = "") => (await env.DB.prepare("INSERT INTO ea_posts(user_id,channel_id,kind,text,file_id,file_name,title,silent,pin,view_delete,run_at,status,created_at,src_url,job_id,error) VALUES(?,?,?,?,'',?,'',0,0,0,?,?,?,?,?,?)").bind(b.userId, b.channelId, kind, text, name, runAt, b.status, now(), src, b.jobId, link).run()).meta.last_row_id;
+  if (p.kind === "none") return [await ins("text", p.text, "", "", b.runAt)];
+  if (p.overflow) {
+    const first = await ins("file", "", MEDIA_NAME[p.kind], p.media, b.runAt);
+    return [first, await ins("text", p.text, "", "", b.runAt + 30, `follows:${first}`)];
+  }
+  return [await ins("file", p.text, MEDIA_NAME[p.kind], p.media, b.runAt)];
 }
 var POST_PARAMS = {
   text: { type: "string", description: "post text; omit when forwarding a source post via from_ref" },
   from_ref: { type: "string", description: "ref of a source post: its full cleaned text is used as-is" },
-  image_ref: { type: "string", description: "ref of a source post whose image/sticker to attach" }
+  image_ref: { type: "string", description: "optional: ref of another post whose image/sticker to attach (from_ref already brings its own photo/video automatically)" },
+  video_ref: { type: "string", description: "optional: ref of a post whose video to attach" }
 };
 var TOOLS = (final) => [
   { type: "function", function: {
     name: "read_channel",
-    description: "Latest unused posts of a PUBLIC Eitaa channel (@id), newest first, short previews. image/sticker=1 flags media.",
+    description: "Latest unused posts of a PUBLIC Eitaa channel (@id), newest first, short previews. image/video/sticker=1 flags media.",
     parameters: { type: "object", properties: { channel: { type: "string" }, full: { type: "boolean", description: "longer previews (only if you must rewrite)" } }, required: ["channel"] }
   } },
   { type: "function", function: {
@@ -877,7 +938,7 @@ async function heuristicRun(env, j, t) {
     const res = await readChannel(env, st, { channel: c, limit: 20 }, j.id, MAX_CHANNELS_PER_RUN);
     for (const p of res.posts || []) {
       const r = st.refs.get(p.ref);
-      if (r.sticker || AD_RE.test(r.text) || r.text.length < 40 && !r.image) continue;
+      if (r.sticker || AD_RE.test(r.text) || r.text.length < 40 && !r.image && !r.video) continue;
       if (needDate && !(mentionsDay(r.text, t) && !mentionsOtherDate(r.text, t))) continue;
       const hit = words(r.text).filter((w) => topic.has(w)).length;
       if (!needDate && topic.size > 2 && hit === 0) continue;
@@ -888,18 +949,17 @@ async function heuristicRun(env, j, t) {
   let n = 0;
   for (const c of cands) {
     if (n >= want) break;
-    const p = resolvePost(st, { from_ref: c.ref, ...c.r.image ? { image_ref: c.ref } : {} }, j.footer);
-    const q = "error" in p ? resolvePost(st, { from_ref: c.ref }, j.footer) : p;
+    const q = resolvePost(st, { from_ref: c.ref }, j.footer);
     if ("error" in q) continue;
     const sig = norm(q.text).replace(/\s+/g, " ").slice(0, 120);
     if (recentNorm.has(sig)) continue;
     recentNorm.add(sig);
     const draft = !!j.approve;
-    const ins = await env.DB.prepare("INSERT INTO ea_posts(user_id,channel_id,kind,text,file_id,file_name,title,silent,pin,view_delete,run_at,status,created_at,src_url,job_id) VALUES(?,?,?,?,'',?,'',0,0,0,?,?,?,?,?)").bind(j.user_id, j.channel_id, q.image ? "file" : "text", q.text, "", now() + n * 20 * 60, draft ? "draft" : "pending", now(), q.image, j.id).run();
+    const ids = await insertResolved(env, { userId: j.user_id, channelId: j.channel_id, jobId: j.id, status: draft ? "draft" : "pending", runAt: now() + n * 20 * 60 }, q);
     await env.DB.prepare("INSERT OR IGNORE INTO agent_seen(job_id,k,seen_at) VALUES(?,?,?)").bind(j.id, c.ref, now()).run();
-    if (draft) await send(env, j.user_id, `\u{1F4DD} <b>\u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 \u0627\u06CC\u062C\u0646\u062A \xAB${esc(j.name)}\xBB</b> (#${ins.meta.last_row_id})
+    if (draft) await send(env, j.user_id, `\u{1F4DD} <b>\u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 \u0627\u06CC\u062C\u0646\u062A \xAB${esc(j.name)}\xBB</b> (#${ids[0]})${q.kind !== "none" ? q.kind === "video" ? " \u{1F3AC}" : " \u{1F5BC}" : ""}
 
-${esc(q.text.slice(0, 1500))}`, ikb([[["\u2705 \u0627\u0646\u062A\u0634\u0627\u0631", `ag:go:${ins.meta.last_row_id}`], ["\u{1F5D1} \u062D\u0630\u0641", `ag:no:${ins.meta.last_row_id}`]]]));
+${esc(q.text.slice(0, 1500))}`, ikb([[["\u2705 \u0627\u0646\u062A\u0634\u0627\u0631", `ag:go:${ids[0]}`], ["\u{1F5D1} \u062D\u0630\u0641", `ag:no:${ids[0]}`]]]));
     n++;
   }
   return { summary: n ? `\u0633\u0647\u0645\u06CC\u0647\u200C\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062A\u0645\u0627\u0645 \u0628\u0648\u062F\u061B \u0628\u0627 \u0645\u0648\u062A\u0648\u0631 \u0642\u0627\u0646\u0648\u0646\u200C\u0645\u062D\u0648\u0631 ${n} \u067E\u0633\u062A \u0627\u0646\u062A\u062E\u0627\u0628 \u0634\u062F.` : "\u0633\u0647\u0645\u06CC\u0647\u200C\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062A\u0645\u0627\u0645 \u0628\u0648\u062F \u0648 \u0645\u0637\u0644\u0628 \u0645\u0646\u0627\u0633\u0628\u06CC \u0628\u0627 \u0642\u0648\u0627\u0646\u06CC\u0646 \u0633\u0627\u062F\u0647 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.", posts: n, retryMin: null };
@@ -931,17 +991,17 @@ ${recent.length ? recent.map((r) => `- ${r.text.replace(/\s+/g, " ").slice(0, 70
         const sig = norm(p.text).replace(/\s+/g, " ").slice(0, 120);
         if (sig && recentNorm.has(sig)) return { error: "duplicate of something already published" };
         const delay = Math.min(Math.max(parseInt(a.delay_minutes, 10) || 0, 0), 720), draft = !!j.approve;
-        const ins = await env.DB.prepare("INSERT INTO ea_posts(user_id,channel_id,kind,text,file_id,file_name,title,silent,pin,view_delete,run_at,status,created_at,src_url,job_id) VALUES(?,?,?,?,'',?,'',0,0,0,?,?,?,?,?)").bind(j.user_id, j.channel_id, p.image ? "file" : "text", p.text, p.sticker ? "sticker.webp" : "", now() + delay * 60, draft ? "draft" : "pending", now(), p.image, j.id).run();
-        const postId = ins.meta.last_row_id;
+        const ids = await insertResolved(env, { userId: j.user_id, channelId: j.channel_id, jobId: j.id, status: draft ? "draft" : "pending", runAt: now() + delay * 60 }, p);
+        const postId = ids[0];
         recentNorm.add(sig);
         state.posts++;
         postedThisStep++;
         const keys = [...new Set(p.refs)].filter((k) => /^[A-Za-z0-9_.]+\/\d+$/.test(k));
         if (keys.length) await env.DB.batch(keys.map((k) => env.DB.prepare("INSERT OR IGNORE INTO agent_seen(job_id,k,seen_at) VALUES(?,?,?)").bind(j.id, k, now())));
-        if (draft) await send(env, j.user_id, `\u{1F4DD} <b>\u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 \u0627\u06CC\u062C\u0646\u062A \xAB${esc(j.name)}\xBB</b> (#${postId})${p.image ? " \u{1F5BC}" : ""}
+        if (draft) await send(env, j.user_id, `\u{1F4DD} <b>\u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 \u0627\u06CC\u062C\u0646\u062A \xAB${esc(j.name)}\xBB</b> (#${postId})${p.kind === "video" ? " \u{1F3AC}" : p.kind !== "none" ? " \u{1F5BC}" : ""}
 
 ${esc(p.text.slice(0, 1500))}`, ikb([[["\u2705 \u0627\u0646\u062A\u0634\u0627\u0631", `ag:go:${postId}`], ["\u{1F5D1} \u062D\u0630\u0641", `ag:no:${postId}`]]]));
-        return { ok: true, post_id: postId };
+        return { ok: true, post_id: postId, media: p.kind };
       }
       case "retry_later": {
         if (final) return { error: "not allowed in the last attempt \u2014 publish now" };
@@ -1171,6 +1231,10 @@ async function onCallback(c, user, admin, q, act, arg, s) {
   if (act === "go" || act === "no") {
     const pid = Number(arg);
     const r = act === "go" ? await env.DB.prepare("UPDATE ea_posts SET status='pending', run_at=? WHERE id=? AND user_id=? AND status='draft'").bind(now(), pid, uid).run() : await env.DB.prepare("UPDATE ea_posts SET status='canceled' WHERE id=? AND user_id=? AND status='draft'").bind(pid, uid).run();
+    if (r.meta.changes) {
+      if (act === "go") await env.DB.prepare("UPDATE ea_posts SET status='pending', run_at=?, error='' WHERE error=? AND user_id=? AND status='draft'").bind(now() + 30, `follows:${pid}`, uid).run();
+      else await env.DB.prepare("UPDATE ea_posts SET status='canceled' WHERE error=? AND user_id=? AND status='draft'").bind(`follows:${pid}`, uid).run();
+    }
     await ans(r.meta.changes ? act === "go" ? "\u062F\u0631 \u0635\u0641 \u0627\u0646\u062A\u0634\u0627\u0631 \u0642\u0631\u0627\u0631 \u06AF\u0631\u0641\u062A." : "\u062D\u0630\u0641 \u0634\u062F." : "\u0642\u0627\u0628\u0644 \u062A\u063A\u06CC\u06CC\u0631 \u0646\u06CC\u0633\u062A.");
     if (mid && r.meta.changes) await edit(env, uid, mid, act === "go" ? `\u{1F680} \u067E\u0633\u062A #${pid} \u062F\u0631 \u0635\u0641 \u0627\u0646\u062A\u0634\u0627\u0631 \u0627\u0633\u062A\u2026` : `\u{1F5D1} \u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 #${pid} \u062D\u0630\u0641 \u0634\u062F.`);
     return;
@@ -1222,10 +1286,12 @@ async function onCallback(c, user, admin, q, act, arg, s) {
 // eitaa-src/scheduler.ts
 var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 var MAX_IMG = 15 * 1024 * 1024;
+var MAX_VIDEO = 45 * 1024 * 1024;
 async function fileBytes(env, p) {
   if (p.src_url) {
-    const f = await fetchBytes(p.src_url, MAX_IMG, eitaaWeb(env) + "/");
-    return { bytes: f.bytes, name: p.file_name || `image.${extFor(f.type, p.src_url)}` };
+    const isVideo = /\.(mp4|mov|webm|mkv)$/i.test(p.file_name) || /\.(mp4|mov|webm)(\?|$)/i.test(p.src_url);
+    const f = await fetchBytes(p.src_url, isVideo ? MAX_VIDEO : MAX_IMG, eitaaWeb(env) + "/");
+    return { bytes: f.bytes, name: isVideo ? p.file_name || "video.mp4" : p.file_name || `image.${extFor(f.type, p.src_url)}` };
   }
   return { bytes: await download(env, p.file_id), name: p.file_name || "file" };
 }
@@ -1234,7 +1300,16 @@ async function sendOnce(env, token, p, ch) {
   let res;
   if (p.kind === "text") res = await sendMessage(env, token, ch.chat_id, p.text, o);
   else {
-    const f = await fileBytes(env, p);
+    let f;
+    try {
+      f = await fileBytes(env, p);
+    } catch (e) {
+      if (!p.src_url || !p.text) throw e;
+      await send(env, p.user_id, `\u26A0\uFE0F \u0631\u0633\u0627\u0646\u0647\u200C\u06CC \u067E\u0633\u062A #${p.id} \u062F\u0627\u0646\u0644\u0648\u062F \u0646\u0634\u062F (${esc(e.message)}) \u0648 \u0641\u0642\u0637 \u0645\u062A\u0646 \u0627\u0631\u0633\u0627\u0644 \u0634\u062F.`);
+      res = await sendMessage(env, token, ch.chat_id, p.text, o);
+      const id0 = res && (res.message_id ?? res.id ?? res.result?.message_id);
+      return id0 ? String(id0) : "";
+    }
     res = await sendFile(env, token, ch.chat_id, f.name, f.bytes, p.text, o);
   }
   const id = res && (res.message_id ?? res.id ?? res.result?.message_id);
@@ -1309,12 +1384,12 @@ var TOOLS2 = [
   { type: "function", function: {
     name: "send_to_me",
     description: 'Show/send something to HIM in this Telegram chat (NOT to any channel): use for "show me / send me / \u0628\u0631\u0627\u0645 \u0628\u0641\u0631\u0633\u062A / \u0646\u0634\u0627\u0646\u0645 \u0628\u062F\u0647". Pass from_ref (full post text) and/or image_ref, or your own text.',
-    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" } } }
+    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" }, video_ref: { type: "string" } } }
   } },
   { type: "function", function: {
     name: "post_to_channel",
-    description: 'PUBLISH to one of HIS OWN channels NOW, only when he explicitly asks to post/publish/send something into his channel (\u06A9\u0627\u0646\u0627\u0644\u0645). Never for "send me". The text must be real post content, never an instruction (real result is returned). To forward a source post pass from_ref (full text copied by the system) and/or image_ref (image or sticker; for a sticker omit text).',
-    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" }, channel_id: { type: "integer", description: "optional if he has one channel" } } }
+    description: 'PUBLISH to one of HIS OWN channels NOW, only when he explicitly asks to post/publish/send something into his channel (\u06A9\u0627\u0646\u0627\u0644\u0645). Never for "send me". The text must be real post content, never an instruction (real result is returned). To forward a source post pass from_ref: the system copies its full text AND its photo/video automatically (video_ref/image_ref only to take media from another post; for a sticker omit text).',
+    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" }, video_ref: { type: "string" }, channel_id: { type: "integer", description: "optional if he has one channel" } } }
   } },
   { type: "function", function: {
     name: "schedule_post",
@@ -1355,13 +1430,17 @@ HIS CHANNELS: ${chans.map((x) => `id=${x.id} \xAB${x.title}\xBB (@${x.chat_id})`
       case "send_to_me": {
         const p = resolvePost(st, a, "");
         if ("error" in p) return { status: "failed", error: p.error };
+        const caption = p.text.slice(0, 1e3);
         try {
-          if (p.sticker && p.image) await tg(env, "sendSticker", { chat_id: uid, sticker: p.image });
-          else if (p.image) await tg(env, "sendPhoto", { chat_id: uid, photo: p.image, caption: p.text.slice(0, 1e3) });
+          if (p.kind === "sticker") await tg(env, "sendSticker", { chat_id: uid, sticker: p.media });
+          else if (p.kind === "video") await tg(env, "sendVideo", { chat_id: uid, video: p.media, caption });
+          else if (p.kind === "image") await tg(env, "sendPhoto", { chat_id: uid, photo: p.media, caption });
           else await send(env, uid, esc(p.text));
-          if (p.image && !p.sticker && p.text.length > 1e3) await send(env, uid, esc(p.text));
+          if (p.kind !== "none" && p.kind !== "sticker" && p.text.length > 1e3) await send(env, uid, esc(p.text));
         } catch (e) {
-          if (p.text) await send(env, uid, esc(p.text));
+          if (p.text) await send(env, uid, esc(p.text) + (p.media ? `
+
+\u{1F517} ${esc(p.media)}` : ""));
           else return { status: "failed", error: e.message };
         }
         notes.push("\u{1F4E8} \u0628\u0631\u0627\u06CC \u0634\u0645\u0627 \u0641\u0631\u0633\u062A\u0627\u062F\u0647 \u0634\u062F.");
@@ -1373,11 +1452,13 @@ HIS CHANNELS: ${chans.map((x) => `id=${x.id} \xAB${x.title}\xBB (@${x.chat_id})`
         const p = resolvePost(st, a, "");
         if ("error" in p) return { status: "failed", error: p.error };
         await show2(`\u{1F4E4} \u062F\u0631 \u062D\u0627\u0644 \u0627\u0631\u0633\u0627\u0644 \u0628\u0647 \xAB${esc(ch.title)}\xBB\u2026`);
-        const id = await insert(ch, p.image ? "file" : "text", p.text, p.image, p.sticker ? "sticker.webp" : "", now());
-        await deliver(env, id, true);
-        const r = await env.DB.prepare("SELECT status, error FROM ea_posts WHERE id=?").bind(id).first();
-        const ok = r?.status === "sent";
-        notes.push(ok ? `\u2705 ${p.sticker ? "\u0627\u0633\u062A\u06CC\u06A9\u0631" : "\u067E\u06CC\u0627\u0645"} \u062F\u0631 \xAB${esc(ch.title)}\xBB \u0627\u0631\u0633\u0627\u0644 \u0634\u062F.` : `\u274C \u0627\u0631\u0633\u0627\u0644 \u0628\u0647 \xAB${esc(ch.title)}\xBB \u0646\u0634\u062F: ${esc(r?.error || "\u062E\u0637\u0627\u06CC \u0646\u0627\u0645\u0634\u062E\u0635")}`);
+        const ids = await insertResolved(env, { userId: uid, channelId: ch.id, jobId: null, status: "pending", runAt: now() }, p);
+        for (const id of ids) await deliver(env, id, true);
+        const rs = (await env.DB.prepare(`SELECT status, error FROM ea_posts WHERE id IN (${ids.join(",")})`).all()).results;
+        const bad = rs.find((x) => x.status !== "sent");
+        const r = bad || rs[0];
+        const ok = !bad && rs.length > 0;
+        notes.push(ok ? `\u2705 ${p.kind === "sticker" ? "\u0627\u0633\u062A\u06CC\u06A9\u0631" : p.kind === "video" ? "\u0648\u06CC\u062F\u06CC\u0648" : p.kind === "image" ? "\u0639\u06A9\u0633" : "\u067E\u06CC\u0627\u0645"} \u062F\u0631 \xAB${esc(ch.title)}\xBB \u0627\u0631\u0633\u0627\u0644 \u0634\u062F.` : `\u274C \u0627\u0631\u0633\u0627\u0644 \u0628\u0647 \xAB${esc(ch.title)}\xBB \u0646\u0634\u062F: ${esc(r?.error || "\u062E\u0637\u0627\u06CC \u0646\u0627\u0645\u0634\u062E\u0635")}`);
         return ok ? { status: "sent" } : { status: "failed", error: r?.error || "unknown error" };
       }
       case "schedule_post": {
@@ -1722,11 +1803,16 @@ async function adminCmd(env, cmd, a) {
       if (!name) return "\u0627\u0633\u062A\u0641\u0627\u062F\u0647: /src channelname";
       const r = await fetchChannel(env, name);
       const m = r.messages[r.messages.length - 1];
-      return `\u{1F52C} ${esc(name)} \u2014 HTTP ${r.status} \u2014 \u067E\u06CC\u0627\u0645\u200C\u0647\u0627\u06CC \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC\u200C\u0634\u062F\u0647: ${r.messages.length} (\u0639\u06A9\u0633: ${r.messages.filter((x) => x.image && !x.sticker).length}\u060C \u0627\u0633\u062A\u06CC\u06A9\u0631: ${r.messages.filter((x) => x.sticker).length})${r.title ? `
+      return `\u{1F52C} ${esc(name)} \u2014 HTTP ${r.status} \u2014 \u067E\u06CC\u0627\u0645\u200C\u0647\u0627\u06CC \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC\u200C\u0634\u062F\u0647: ${r.messages.length} (\u0639\u06A9\u0633: ${r.messages.filter((x) => x.image && !x.sticker && !x.video).length}\u060C \u0648\u06CC\u062F\u06CC\u0648: ${r.messages.filter((x) => x.video).length}\u060C \u0627\u0633\u062A\u06CC\u06A9\u0631: ${r.messages.filter((x) => x.sticker).length})${r.title ? `
 \u0639\u0646\u0648\u0627\u0646: ${esc(r.title)}` : ""}${r.note ? `
-\u26A0\uFE0F ${esc(r.note)}` : ""}` + (m ? `
+\u26A0\uFE0F ${esc(r.note)}` : ""}${r.hint ? `
+\u{1F50E} ${esc(r.hint)}` : ""}` + (() => {
+        const mm = r.messages.slice().reverse().find((x) => x.videoUrl || x.image);
+        return mm ? `
+\u{1F39E} \u0631\u0633\u0627\u0646\u0647\u200C\u06CC #${mm.id}: ${esc(mm.videoUrl || mm.image)}` : "";
+      })() + (m ? `
 
-\u0622\u062E\u0631\u06CC\u0646 \u067E\u06CC\u0627\u0645 (#${m.id}${m.image ? " \u{1F5BC}" : ""}):
+\u0622\u062E\u0631\u06CC\u0646 \u067E\u06CC\u0627\u0645 (#${m.id}${m.videoUrl || m.video ? " \u{1F3AC}" : m.image ? " \u{1F5BC}" : ""}):
 ${esc(cleanText(m.text, name, r.title).slice(0, 500))}` : `
 
 \u0646\u0645\u0648\u0646\u0647\u200C\u06CC \u0645\u062A\u0646 \u0635\u0641\u062D\u0647:
@@ -1874,5 +1960,7 @@ export {
   adapt,
   cron,
   ensureSchema,
-  handle
+  handle,
+  parseMessages,
+  resolvePost
 };

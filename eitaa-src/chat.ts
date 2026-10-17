@@ -1,6 +1,6 @@
 // Live conversation with the agent inside the bot: the owner talks, the agent acts right away with real tools
 // (read a public channel, send to his channel and wait for the real delivery result, schedule) and reports what actually happened.
-import { RefInfo, readChannel, resolvePost } from "./agent";
+import { RefInfo, insertResolved, readChannel, resolvePost } from "./agent";
 import { ChannelRow, UserRow, getSession, now, setSession, userChannels } from "./db";
 import { Env } from "./env";
 import { ChatMsg, ToolDef, chatTools } from "./llm";
@@ -33,9 +33,9 @@ const TOOLS: ToolDef[] = [
   { type: "function", function: { name: "read_channel", description: "Latest posts of a PUBLIC Eitaa channel (@id), newest first, short previews (ref, text; image/sticker=1).",
     parameters: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } } },
   { type: "function", function: { name: "send_to_me", description: "Show/send something to HIM in this Telegram chat (NOT to any channel): use for \"show me / send me / برام بفرست / نشانم بده\". Pass from_ref (full post text) and/or image_ref, or your own text.",
-    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" } } } } },
-  { type: "function", function: { name: "post_to_channel", description: "PUBLISH to one of HIS OWN channels NOW, only when he explicitly asks to post/publish/send something into his channel (کانالم). Never for \"send me\". The text must be real post content, never an instruction (real result is returned). To forward a source post pass from_ref (full text copied by the system) and/or image_ref (image or sticker; for a sticker omit text).",
-    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" }, channel_id: { type: "integer", description: "optional if he has one channel" } } } } },
+    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" }, video_ref: { type: "string" } } } } },
+  { type: "function", function: { name: "post_to_channel", description: "PUBLISH to one of HIS OWN channels NOW, only when he explicitly asks to post/publish/send something into his channel (کانالم). Never for \"send me\". The text must be real post content, never an instruction (real result is returned). To forward a source post pass from_ref: the system copies its full text AND its photo/video automatically (video_ref/image_ref only to take media from another post; for a sticker omit text).",
+    parameters: { type: "object", properties: { text: { type: "string" }, from_ref: { type: "string" }, image_ref: { type: "string" }, video_ref: { type: "string" }, channel_id: { type: "integer", description: "optional if he has one channel" } } } } },
   { type: "function", function: { name: "schedule_post", description: "Schedule a text post. when: \"18:30\", \"فردا 09:00\", \"+45\" (minutes), \"1405/07/20 18:30\" (Tehran).",
     parameters: { type: "object", properties: { text: { type: "string" }, when: { type: "string" }, channel_id: { type: "integer" } }, required: ["text", "when"] } } },
 ];
@@ -80,13 +80,15 @@ export async function turn(c: Ctx, user: UserRow, m: TgMessage, text: string, da
       case "send_to_me": {
         const p = resolvePost(st, a, "");
         if ("error" in p) return { status: "failed", error: p.error };
+        const caption = p.text.slice(0, 1000);
         try {
-          if (p.sticker && p.image) await tg.tg(env, "sendSticker", { chat_id: uid, sticker: p.image });
-          else if (p.image) await tg.tg(env, "sendPhoto", { chat_id: uid, photo: p.image, caption: p.text.slice(0, 1000) });
+          if (p.kind === "sticker") await tg.tg(env, "sendSticker", { chat_id: uid, sticker: p.media });
+          else if (p.kind === "video") await tg.tg(env, "sendVideo", { chat_id: uid, video: p.media, caption });
+          else if (p.kind === "image") await tg.tg(env, "sendPhoto", { chat_id: uid, photo: p.media, caption });
           else await tg.send(env, uid, esc(p.text));
-          if (p.image && !p.sticker && p.text.length > 1000) await tg.send(env, uid, esc(p.text));
+          if (p.kind !== "none" && p.kind !== "sticker" && p.text.length > 1000) await tg.send(env, uid, esc(p.text));
         } catch (e) {
-          if (p.text) await tg.send(env, uid, esc(p.text)); else return { status: "failed", error: (e as Error).message };
+          if (p.text) await tg.send(env, uid, esc(p.text) + (p.media ? `\n\n🔗 ${esc(p.media)}` : "")); else return { status: "failed", error: (e as Error).message };
         }
         notes.push("📨 برای شما فرستاده شد.");
         return { status: "sent_to_user" };
@@ -97,11 +99,13 @@ export async function turn(c: Ctx, user: UserRow, m: TgMessage, text: string, da
         const p = resolvePost(st, a, "");
         if ("error" in p) return { status: "failed", error: p.error };
         await show(`📤 در حال ارسال به «${esc(ch.title)}»…`);
-        const id = await insert(ch, p.image ? "file" : "text", p.text, p.image, p.sticker ? "sticker.webp" : "", now());
-        await deliver(env, id, true);
-        const r = await env.DB.prepare("SELECT status, error FROM ea_posts WHERE id=?").bind(id).first<{ status: string; error: string }>();
-        const ok = r?.status === "sent";
-        notes.push(ok ? `✅ ${p.sticker ? "استیکر" : "پیام"} در «${esc(ch.title)}» ارسال شد.` : `❌ ارسال به «${esc(ch.title)}» نشد: ${esc(r?.error || "خطای نامشخص")}`);
+        const ids = await insertResolved(env, { userId: uid, channelId: ch.id, jobId: null, status: "pending", runAt: now() }, p);
+        for (const id of ids) await deliver(env, id, true);
+        const rs = (await env.DB.prepare(`SELECT status, error FROM ea_posts WHERE id IN (${ids.join(",")})`).all<{ status: string; error: string }>()).results;
+        const bad = rs.find((x) => x.status !== "sent");
+        const r = bad || rs[0];
+        const ok = !bad && rs.length > 0;
+        notes.push(ok ? `✅ ${p.kind === "sticker" ? "استیکر" : p.kind === "video" ? "ویدیو" : p.kind === "image" ? "عکس" : "پیام"} در «${esc(ch.title)}» ارسال شد.` : `❌ ارسال به «${esc(ch.title)}» نشد: ${esc(r?.error || "خطای نامشخص")}`);
         return ok ? { status: "sent" } : { status: "failed", error: r?.error || "unknown error" };
       }
       case "schedule_post": {

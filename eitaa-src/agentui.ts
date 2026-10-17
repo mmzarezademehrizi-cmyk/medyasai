@@ -154,6 +154,10 @@ export async function onCallback(c: Ctx, user: UserRow, admin: boolean, q: TgCal
     const r = act === "go"
       ? await env.DB.prepare("UPDATE ea_posts SET status='pending', run_at=? WHERE id=? AND user_id=? AND status='draft'").bind(now(), pid, uid).run()
       : await env.DB.prepare("UPDATE ea_posts SET status='canceled' WHERE id=? AND user_id=? AND status='draft'").bind(pid, uid).run();
+    if (r.meta.changes) {   // a long text that follows its media post (caption limit) is approved/rejected together with it
+      if (act === "go") await env.DB.prepare("UPDATE ea_posts SET status='pending', run_at=?, error='' WHERE error=? AND user_id=? AND status='draft'").bind(now() + 30, `follows:${pid}`, uid).run();
+      else await env.DB.prepare("UPDATE ea_posts SET status='canceled' WHERE error=? AND user_id=? AND status='draft'").bind(`follows:${pid}`, uid).run();
+    }
     await ans(r.meta.changes ? (act === "go" ? "در صف انتشار قرار گرفت." : "حذف شد.") : "قابل تغییر نیست.");
     if (mid && r.meta.changes) await tg.edit(env, uid, mid, act === "go" ? `🚀 پست #${pid} در صف انتشار است…` : `🗑 پیش‌نویس #${pid} حذف شد.`);
     return;

@@ -6,6 +6,8 @@ import { TgUpdate } from "./tg";
 import { SCHEMA } from "./schema";
 
 export { SCHEMA };
+export { parseMessages } from "./source";
+export { resolvePost } from "./agent";
 export type HostEnv = Record<string, any>;
 
 /** Adapter: the AI bot's env (TELEGRAM_TOKEN, OWNER_ID, WEBHOOK_SECRET…) -> this module's env. */

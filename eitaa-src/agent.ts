@@ -137,7 +137,7 @@ async function runJob(env: Env, j: JobRow, slot: Slot, t: number): Promise<void>
 // ------------------------------------------------------------------ shared tool: read a public channel
 // Token economy: the model only sees fresh, unused, recent posts with a short preview. To forward a post it passes `from_ref`
 // and the CODE copies the full cleaned text — so long posts are never sent to the model twice nor written back token by token.
-export interface RefInfo { image: string; text: string; sticker: boolean }
+export interface RefInfo { image: string; text: string; sticker: boolean; video: string; hasVideo: boolean }
 export interface ReadState { channels: Map<string, Awaited<ReturnType<typeof fetchChannel>>>; refs: Map<string, RefInfo> }
 const PREVIEW = 260, PREVIEW_FULL = 1000, MAX_POSTS_SHOWN = 8, MAX_AGE_S = 3 * 86400;
 
@@ -157,28 +157,50 @@ export async function readChannel(env: Env, st: ReadState, a: any, jobId: number
     const ref = `${cid}/${m.id}`;
     if (seen.has(ref) || (m.ts !== null && t - m.ts > MAX_AGE_S)) { hidden++; continue; }
     const text = cleanText(m.text, cid, r.title);
-    st.refs.set(ref, { image: m.image, text, sticker: m.sticker });
+    st.refs.set(ref, { image: m.image, text, sticker: m.sticker, video: m.videoUrl, hasVideo: m.video });
     if (posts.length >= limit) continue;
     const d = m.ts ? toLocal(m.ts) : null;
-    posts.push({ ref, ...(d ? { date: `${d.y}-${pad2(d.mo)}-${pad2(d.d)} ${pad2(d.h)}:${pad2(d.mi)}` } : {}), text: text.slice(0, cut) + (text.length > cut ? "…" : ""), ...(m.image && !m.sticker ? { image: 1 } : {}), ...(m.sticker ? { sticker: 1 } : {}) });
+    posts.push({ ref, ...(d ? { date: `${d.y}-${pad2(d.mo)}-${pad2(d.d)} ${pad2(d.h)}:${pad2(d.mi)}` } : {}), text: text.slice(0, cut) + (text.length > cut ? "…" : ""), ...(m.videoUrl ? { video: 1 } : m.video ? { video_thumb_only: 1 } : m.image && !m.sticker ? { image: 1 } : {}), ...(m.sticker ? { sticker: 1 } : {}) });
   }
   return { channel: cid, posts, ...(hidden ? { hidden_old_or_used: hidden } : {}) };
 }
 
-/** Text/sticker/image of a post the model refers to, as the code should publish it. */
-export function resolvePost(st: ReadState, a: any, footer: string): { text: string; image: string; sticker: boolean; refs: string[] } | { error: string } {
+/** What the code publishes for a post the model refers to. Media of a forwarded source post (video, else image/sticker) is attached AUTOMATICALLY. */
+export interface Resolved { text: string; media: string; kind: "none" | "image" | "video" | "sticker"; refs: string[]; overflow: boolean }
+export function resolvePost(st: ReadState, a: any, footer: string): Resolved | { error: string } {
   let text = String(a.text || "").trim();
-  const fromRef = a.from_ref ? String(a.from_ref) : "", imageRef = a.image_ref ? String(a.image_ref) : "";
-  if (fromRef && !text) { const r = st.refs.get(fromRef); if (!r) return { error: "unknown from_ref (use a ref from read_channel)" }; text = r.text; }
-  const ri = imageRef ? st.refs.get(imageRef) : undefined;
-  if (imageRef && !ri?.image) return { error: "image_ref has no image/sticker" };
-  const sticker = !!ri?.sticker;
-  if (sticker) text = "";                                               // a sticker carries no caption, so no signature either
-  if (!text && !ri) return { error: "empty post" };
+  const fromRef = a.from_ref ? String(a.from_ref) : "", imageRef = a.image_ref ? String(a.image_ref) : "", videoRef = a.video_ref ? String(a.video_ref) : "";
+  const src = fromRef ? st.refs.get(fromRef) : undefined;
+  if (fromRef && !src) return { error: "unknown from_ref (use a ref from read_channel)" };
+  if (fromRef && !text) text = src!.text;
+  let media = "", kind = "none" as Resolved["kind"];
+  const take = (ref: string): boolean => {
+    const r = st.refs.get(ref);
+    if (!r) return false;
+    if (r.video) { media = r.video; kind = "video"; return true; }
+    if (r.image) { media = r.image; kind = r.sticker ? "sticker" : "image"; return true; }
+    return false;
+  };
+  if (videoRef && !take(videoRef)) return { error: "video_ref has no downloadable video" };
+  if (!media && imageRef && !take(imageRef)) return { error: "image_ref has no image/sticker" };
+  if (!media && fromRef) take(fromRef);                                  // automatic: a forwarded post keeps its photo/video
+  if (kind === "sticker") text = "";                                       // a sticker carries no caption, so no signature either
+  if (!text && !media) return { error: "empty post" };
   const full = text ? text + (footer ? `\n\n${footer}` : "") : "";
-  if (ri && !sticker && full.length > 1000) return { error: "text+signature too long for a post with image (max 1000 chars): shorten or drop image_ref" };
   if (full.length > 3900) return { error: "text too long (max ~3900)" };
-  return { text: full, image: ri?.image || "", sticker, refs: [fromRef, imageRef].filter(Boolean) };
+  return { text: full, media, kind, refs: [fromRef, imageRef, videoRef].filter(Boolean), overflow: !!media && kind !== "sticker" && full.length > 1000 };
+}
+
+export const MEDIA_NAME: Record<string, string> = { sticker: "sticker.webp", video: "video.mp4", image: "", none: "" };
+
+/** Inserts the post(s) for a resolved item. A caption is limited (1000 chars): longer text goes out as a second post right after the media. */
+export async function insertResolved(env: Env, b: { userId: number; channelId: number; jobId: number | null; status: string; runAt: number }, p: Resolved): Promise<number[]> {
+  const ins = async (kind: "text" | "file", text: string, name: string, src: string, runAt: number, link = "") =>
+    (await env.DB.prepare("INSERT INTO ea_posts(user_id,channel_id,kind,text,file_id,file_name,title,silent,pin,view_delete,run_at,status,created_at,src_url,job_id,error) VALUES(?,?,?,?,'',?,'',0,0,0,?,?,?,?,?,?)")
+      .bind(b.userId, b.channelId, kind, text, name, runAt, b.status, now(), src, b.jobId, link).run()).meta.last_row_id as number;
+  if (p.kind === "none") return [await ins("text", p.text, "", "", b.runAt)];
+  if (p.overflow) { const first = await ins("file", "", MEDIA_NAME[p.kind], p.media, b.runAt); return [first, await ins("text", p.text, "", "", b.runAt + 30, `follows:${first}`)]; }
+  return [await ins("file", p.text, MEDIA_NAME[p.kind], p.media, b.runAt)];
 }
 
 // ------------------------------------------------------------------ the agent loop
@@ -187,10 +209,11 @@ interface RunResult { summary: string; posts: number; retryMin: number | null; e
 const POST_PARAMS = {
   text: { type: "string", description: "post text; omit when forwarding a source post via from_ref" },
   from_ref: { type: "string", description: "ref of a source post: its full cleaned text is used as-is" },
-  image_ref: { type: "string", description: "ref of a source post whose image/sticker to attach" },
+  image_ref: { type: "string", description: "optional: ref of another post whose image/sticker to attach (from_ref already brings its own photo/video automatically)" },
+  video_ref: { type: "string", description: "optional: ref of a post whose video to attach" },
 };
 const TOOLS = (final: boolean): ToolDef[] => [
-  { type: "function", function: { name: "read_channel", description: "Latest unused posts of a PUBLIC Eitaa channel (@id), newest first, short previews. image/sticker=1 flags media.",
+  { type: "function", function: { name: "read_channel", description: "Latest unused posts of a PUBLIC Eitaa channel (@id), newest first, short previews. image/video/sticker=1 flags media.",
     parameters: { type: "object", properties: { channel: { type: "string" }, full: { type: "boolean", description: "longer previews (only if you must rewrite)" } }, required: ["channel"] } } },
   { type: "function", function: { name: "post_to_channel", description: "Publish to the owner's channel (his signature is appended by the system). Call it ONCE per post, all posts in the same step.",
     parameters: { type: "object", properties: { ...POST_PARAMS, delay_minutes: { type: "integer", description: "0-720; spread several posts" } } } } },
@@ -216,7 +239,7 @@ async function heuristicRun(env: Env, j: JobRow, t: number): Promise<RunResult> 
     const res: any = await readChannel(env, st, { channel: c, limit: 20 }, j.id, MAX_CHANNELS_PER_RUN);
     for (const p of res.posts || []) {
       const r = st.refs.get(p.ref)!;
-      if (r.sticker || AD_RE.test(r.text) || (r.text.length < 40 && !r.image)) continue;
+      if (r.sticker || AD_RE.test(r.text) || (r.text.length < 40 && !r.image && !r.video)) continue;
       if (needDate && !(mentionsDay(r.text, t) && !mentionsOtherDate(r.text, t))) continue;
       const hit = words(r.text).filter((w) => topic.has(w)).length;
       if (!needDate && topic.size > 2 && hit === 0) continue;
@@ -227,17 +250,15 @@ async function heuristicRun(env: Env, j: JobRow, t: number): Promise<RunResult> 
   let n = 0;
   for (const c of cands) {
     if (n >= want) break;
-    const p = resolvePost(st, { from_ref: c.ref, ...(c.r.image ? { image_ref: c.ref } : {}) }, j.footer);
-    const q = "error" in p ? resolvePost(st, { from_ref: c.ref }, j.footer) : p;
+    const q = resolvePost(st, { from_ref: c.ref }, j.footer);
     if ("error" in q) continue;
     const sig = norm(q.text).replace(/\s+/g, " ").slice(0, 120);
     if (recentNorm.has(sig)) continue;
     recentNorm.add(sig);
     const draft = !!j.approve;
-    const ins = await env.DB.prepare("INSERT INTO ea_posts(user_id,channel_id,kind,text,file_id,file_name,title,silent,pin,view_delete,run_at,status,created_at,src_url,job_id) VALUES(?,?,?,?,'',?,'',0,0,0,?,?,?,?,?)")
-      .bind(j.user_id, j.channel_id, q.image ? "file" : "text", q.text, "", now() + n * 20 * 60, draft ? "draft" : "pending", now(), q.image, j.id).run();
+    const ids = await insertResolved(env, { userId: j.user_id, channelId: j.channel_id, jobId: j.id, status: draft ? "draft" : "pending", runAt: now() + n * 20 * 60 }, q);
     await env.DB.prepare("INSERT OR IGNORE INTO agent_seen(job_id,k,seen_at) VALUES(?,?,?)").bind(j.id, c.ref, now()).run();
-    if (draft) await tg.send(env, j.user_id, `📝 <b>پیش‌نویس ایجنت «${esc(j.name)}»</b> (#${ins.meta.last_row_id})\n\n${esc(q.text.slice(0, 1500))}`, ikb([[["✅ انتشار", `ag:go:${ins.meta.last_row_id}`], ["🗑 حذف", `ag:no:${ins.meta.last_row_id}`]]] as Btn[][]));
+    if (draft) await tg.send(env, j.user_id, `📝 <b>پیش‌نویس ایجنت «${esc(j.name)}»</b> (#${ids[0]})${q.kind !== "none" ? (q.kind === "video" ? " 🎬" : " 🖼") : ""}\n\n${esc(q.text.slice(0, 1500))}`, ikb([[["✅ انتشار", `ag:go:${ids[0]}`], ["🗑 حذف", `ag:no:${ids[0]}`]]] as Btn[][]));
     n++;
   }
   return { summary: n ? `سهمیه‌ی هوش مصنوعی تمام بود؛ با موتور قانون‌محور ${n} پست انتخاب شد.` : "سهمیه‌ی هوش مصنوعی تمام بود و مطلب مناسبی با قوانین ساده پیدا نشد.", posts: n, retryMin: null };
@@ -273,14 +294,13 @@ async function runAgent(env: Env, j: JobRow, slot: Slot, final: boolean): Promis
         const sig = norm(p.text).replace(/\s+/g, " ").slice(0, 120);
         if (sig && recentNorm.has(sig)) return { error: "duplicate of something already published" };
         const delay = Math.min(Math.max(parseInt(a.delay_minutes, 10) || 0, 0), 720), draft = !!j.approve;
-        const ins = await env.DB.prepare("INSERT INTO ea_posts(user_id,channel_id,kind,text,file_id,file_name,title,silent,pin,view_delete,run_at,status,created_at,src_url,job_id) VALUES(?,?,?,?,'',?,'',0,0,0,?,?,?,?,?)")
-          .bind(j.user_id, j.channel_id, p.image ? "file" : "text", p.text, p.sticker ? "sticker.webp" : "", now() + delay * 60, draft ? "draft" : "pending", now(), p.image, j.id).run();
-        const postId = ins.meta.last_row_id as number;
+        const ids = await insertResolved(env, { userId: j.user_id, channelId: j.channel_id, jobId: j.id, status: draft ? "draft" : "pending", runAt: now() + delay * 60 }, p);
+        const postId = ids[0];
         recentNorm.add(sig); state.posts++; postedThisStep++;
         const keys = [...new Set(p.refs)].filter((k) => /^[A-Za-z0-9_.]+\/\d+$/.test(k));
         if (keys.length) await env.DB.batch(keys.map((k) => env.DB.prepare("INSERT OR IGNORE INTO agent_seen(job_id,k,seen_at) VALUES(?,?,?)").bind(j.id, k, now())));
-        if (draft) await tg.send(env, j.user_id, `📝 <b>پیش‌نویس ایجنت «${esc(j.name)}»</b> (#${postId})${p.image ? " 🖼" : ""}\n\n${esc(p.text.slice(0, 1500))}`, ikb([[["✅ انتشار", `ag:go:${postId}`], ["🗑 حذف", `ag:no:${postId}`]]] as Btn[][]));
-        return { ok: true, post_id: postId };
+        if (draft) await tg.send(env, j.user_id, `📝 <b>پیش‌نویس ایجنت «${esc(j.name)}»</b> (#${postId})${p.kind === "video" ? " 🎬" : p.kind !== "none" ? " 🖼" : ""}\n\n${esc(p.text.slice(0, 1500))}`, ikb([[["✅ انتشار", `ag:go:${postId}`], ["🗑 حذف", `ag:no:${postId}`]]] as Btn[][]));
+        return { ok: true, post_id: postId, media: p.kind };
       }
       case "retry_later": {
         if (final) return { error: "not allowed in the last attempt — publish now" };

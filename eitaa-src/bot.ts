@@ -262,8 +262,9 @@ async function adminCmd(env: Env, cmd: string, a: string[]): Promise<string> {
       if (!name) return "استفاده: /src channelname";
       const r = await fetchChannel(env, name);
       const m = r.messages[r.messages.length - 1];
-      return `🔬 ${esc(name)} — HTTP ${r.status} — پیام‌های شناسایی‌شده: ${r.messages.length} (عکس: ${r.messages.filter((x) => x.image && !x.sticker).length}، استیکر: ${r.messages.filter((x) => x.sticker).length})${r.title ? `\nعنوان: ${esc(r.title)}` : ""}${r.note ? `\n⚠️ ${esc(r.note)}` : ""}` +
-        (m ? `\n\nآخرین پیام (#${m.id}${m.image ? " 🖼" : ""}):\n${esc(cleanText(m.text, name, r.title).slice(0, 500))}` : `\n\nنمونه‌ی متن صفحه:\n${esc(r.snippet)}`);
+      return `🔬 ${esc(name)} — HTTP ${r.status} — پیام‌های شناسایی‌شده: ${r.messages.length} (عکس: ${r.messages.filter((x) => x.image && !x.sticker && !x.video).length}، ویدیو: ${r.messages.filter((x) => x.video).length}، استیکر: ${r.messages.filter((x) => x.sticker).length})${r.title ? `\nعنوان: ${esc(r.title)}` : ""}${r.note ? `\n⚠️ ${esc(r.note)}` : ""}${r.hint ? `\n🔎 ${esc(r.hint)}` : ""}` +
+        (() => { const mm = r.messages.slice().reverse().find((x) => x.videoUrl || x.image); return mm ? `\n🎞 رسانه‌ی #${mm.id}: ${esc(mm.videoUrl || mm.image)}` : ""; })() +
+        (m ? `\n\nآخرین پیام (#${m.id}${m.videoUrl || m.video ? " 🎬" : m.image ? " 🖼" : ""}):\n${esc(cleanText(m.text, name, r.title).slice(0, 500))}` : `\n\nنمونه‌ی متن صفحه:\n${esc(r.snippet)}`);
     }
     case "/ban": case "/unban": {
       if (!id) return `استفاده: ${cmd} ID`;
