@@ -16,7 +16,7 @@ const CF_BASE = process.env.CF_API_BASE || 'https://api.cloudflare.com/client/v4
 const TG_BASE = process.env.TG_API_BASE || 'https://api.telegram.org';
 const GH_BASE = process.env.GH_API_BASE || 'https://api.github.com';
 const COMPAT_DATE = '2025-06-01';
-const CRON = '*/2 * * * *';
+const CRON = '* * * * *';
 
 const c = { g: (s) => `\x1b[32m${s}\x1b[0m`, r: (s) => `\x1b[31m${s}\x1b[0m`, y: (s) => `\x1b[33m${s}\x1b[0m`, b: (s) => `\x1b[1m${s}\x1b[0m`, d: (s) => `\x1b[2m${s}\x1b[0m` };
 const say = (s = '') => console.log(s);
@@ -168,6 +168,7 @@ async function main() {
   say(c.d('اگر خالی بگذارید از فایل‌های همین پوشه استفاده می‌شود.'));
   const repoUrl = await ask('لینک GitHub (مثل https://github.com/user/repo)', { env: 'GITHUB_REPO', required: false });
   let code;
+  let eitaaCode;
   let schema;
   let source;
   if (repoUrl) {
@@ -181,6 +182,7 @@ async function main() {
       try {
         code = await ghFile(repo, 'src/index.js', ghToken);
         schema = await ghFile(repo, 'schema.sql', ghToken);
+        eitaaCode = await ghFile(repo, 'src/eitaa.js', ghToken);
         break;
       } catch (e) {
         if ((e.status === 404 || e.status === 401 || e.status === 403) && !ghToken) {
@@ -193,21 +195,22 @@ async function main() {
         }
       }
     }
-    if (!code || !schema) {
-      say(c.r('✖ فایل‌های src/index.js و schema.sql از مخزن خوانده نشد. مطمئن شوید آپلود شده‌اند.'));
+    if (!code || !schema || !eitaaCode) {
+      say(c.r('✖ فایل‌های src/index.js و src/eitaa.js و schema.sql از مخزن خوانده نشد. مطمئن شوید آپلود شده‌اند.'));
       process.exit(1);
     }
     source = `${repo.owner}/${repo.repo}`;
   } else {
     code = fs.readFileSync(path.join(HERE, 'src/index.js'), 'utf8');
     schema = fs.readFileSync(path.join(HERE, 'schema.sql'), 'utf8');
+    eitaaCode = fs.readFileSync(path.join(HERE, 'src/eitaa.js'), 'utf8');
     source = 'local';
   }
-  if (!/export default/.test(code) || !/CREATE TABLE/i.test(schema)) {
+  if (!/export default/.test(code) || !/CREATE TABLE/i.test(schema) || !/export \{/.test(eitaaCode)) {
     say(c.r('✖ محتوای فایل‌ها معتبر به نظر نمی‌رسد.'));
     process.exit(1);
   }
-  const sha = crypto.createHash('sha256').update(code).digest('hex').slice(0, 12);
+  const sha = crypto.createHash('sha256').update(code + eitaaCode).digest('hex').slice(0, 12);
   ok(`کد دریافت شد (${source}, ${Math.round(code.length / 1024)}KB, sha256:${sha})`);
   say();
 
@@ -328,6 +331,7 @@ async function main() {
     const fd = new FormData();
     fd.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
     fd.append('index.js', new Blob([code], { type: 'application/javascript+module' }), 'index.js');
+    fd.append('eitaa.js', new Blob([eitaaCode], { type: 'application/javascript+module' }), 'eitaa.js');
     const r = await fetch(`${CF_BASE}/accounts/${acc}/workers/scripts/${workerName}`, {
       method: 'PUT',
       headers: { authorization: 'Bearer ' + token },
@@ -378,7 +382,7 @@ async function main() {
     const w = await tgApi(tgToken, 'setWebhook', {
       url: `${siteUrl}/telegram`,
       secret_token: webhookSecret,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'callback_query'],
       max_connections: 40,
     });
     if (w && w.ok) ok('وب‌هوک مستقیماً ثبت شد');

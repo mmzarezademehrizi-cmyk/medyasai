@@ -6,7 +6,9 @@
 //    حافظه بلندمدت، پلن/سهمیه، پنل مدیریت
 // ============================================================================
 
-const VERSION = '1.0.0';
+import * as ea from './eitaa.js';
+
+const VERSION = '1.1.0';
 
 const DEF = {
   MODEL: '@cf/google/gemma-4-26b-a4b-it', // متن + تصویر + ابزار
@@ -206,6 +208,7 @@ let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
   await env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)));
+  await ea.ensureSchema(env);
   schemaReady = true;
 }
 
@@ -374,7 +377,7 @@ async function ensureWebhook(env, originFallback) {
     const w = await tg(env, 'setWebhook', {
       url: res.url,
       secret_token: env.WEBHOOK_SECRET,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'callback_query'],
       max_connections: 40,
     });
     if (!w.ok) {
@@ -811,7 +814,45 @@ function parseCommand(text) {
   return m ? { cmd: m[1].toLowerCase(), arg: (m[2] || '').trim() } : null;
 }
 
-async function handleUpdate(env, origin, update) {
+// ---------------------------------------------------------------------------
+// ماژول ایتا (کانال‌ها، زمان‌بندی، ایجنت‌ها، گفتگوی زنده) — با /eitaa باز می‌شود
+// ---------------------------------------------------------------------------
+const EA_BACK = '🔙 بازگشت به هوش مصنوعی';
+async function eitaaAccess(env, uid) {
+  if (isOwner(env, uid)) return true;
+  const u = await env.DB.prepare('SELECT plan, plan_until FROM users WHERE id=?1').bind(uid).first();
+  return !!(u && effPlan(u) !== 'free');
+}
+const eitaaMode = async (env, uid) => !!(await getSetting(env, 'eamode:' + uid));
+const setEitaaMode = (env, uid, on) =>
+  on ? setSetting(env, 'eamode:' + uid, '1') : env.DB.prepare('DELETE FROM settings WHERE key=?1').bind('eamode:' + uid).run();
+
+/** true = پیام توسط ماژول ایتا مدیریت شد */
+async function eitaaRoute(env, update, wait) {
+  const msg = update.message;
+  const uid = msg.from.id;
+  const text = (msg.text || '').trim();
+  const ci = parseCommand(text);
+  if (ci && ci.cmd === 'eitaa') {
+    await setEitaaMode(env, uid, true);
+    await ea.handle(env, await eitaaAccess(env, uid), { ...update, message: { ...msg, text: '/start' } }, wait);
+    return true;
+  }
+  if (!(await eitaaMode(env, uid))) return false;
+  if (text === EA_BACK || (ci && ci.cmd === 'ai')) {
+    await setEitaaMode(env, uid, false);
+    await tg(env, 'sendMessage', { chat_id: msg.chat.id, text: 'به حالت هوش مصنوعی برگشتید 🤖 هر چه می‌خواهید بپرسید. (بخش ایتا: /eitaa)', reply_markup: { remove_keyboard: true } });
+    return true;
+  }
+  await ea.handle(env, await eitaaAccess(env, uid), update, wait);
+  return true;
+}
+
+async function handleUpdate(env, origin, update, wait = () => {}) {
+  const cq = update.callback_query;
+  if (cq && cq.message && cq.message.chat && cq.message.chat.type === 'private') {
+    return ea.handle(env, await eitaaAccess(env, cq.from.id), update, wait);
+  }
   const msg = update.message;
   if (!msg || !msg.from || msg.from.is_bot || !msg.chat) return;
   const chat = msg.chat;
@@ -824,6 +865,8 @@ async function handleUpdate(env, origin, update) {
     .run();
   if (!upd.meta || !upd.meta.changes) return;
   if (user.banned) return;
+
+  if (!isGroup && (await eitaaRoute(env, update, wait))) return;
 
   let text = (msg.text || msg.caption || '').trim();
   const replyExtra = isGroup ? { reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true } } : {};
@@ -1050,7 +1093,7 @@ async function handleCommand(env, origin, msg, user, ci, extra) {
     }
     case 'help':
       await reply(
-        'دستورات:\n/image توضیح — ساخت تصویر\n/new — شروع گفتگوی جدید\n/memory — دیدن چیزهایی که درباره‌ی شما به خاطر دارم\n/forget — پاک کردن حافظه و تاریخچه\n/plan — پلن و سهمیه امروز\n/id — شناسه عددی شما' +
+        'دستورات:\n/image توضیح — ساخت تصویر\n/eitaa — بخش ایتا (کانال، زمان‌بندی، ایجنت)\n/new — شروع گفتگوی جدید\n/memory — دیدن چیزهایی که درباره‌ی شما به خاطر دارم\n/forget — پاک کردن حافظه و تاریخچه\n/plan — پلن و سهمیه امروز\n/id — شناسه عددی شما' +
           (owner ? '\n\nمالک:\n/panel — لینک پنل مدیریت\n/stats — آمار\n/grant ID PLAN DAYS — فعال‌سازی پلن\n/revoke ID — بازگشت به پلن رایگان\n/ban ID  /unban ID\n/setprompt متن — دستور اضافه برای هوش مصنوعی\n/resetprompt\n/setwelcome متن\n/setcontact متن\n/diag — تست سلامت قابلیت‌ها' : '')
       );
       return true;
@@ -1462,7 +1505,7 @@ loadStats(); loadSettings(); loadUsers();
 // ---------------------------------------------------------------------------
 // مسیرها
 // ---------------------------------------------------------------------------
-async function route(request, env) {
+async function route(request, env, ctx) {
   const url = new URL(request.url);
   const p = url.pathname;
 
@@ -1478,7 +1521,7 @@ async function route(request, env) {
     }
     await ensureSchema(env);
     try {
-      await handleUpdate(env, url.origin, update);
+      await handleUpdate(env, url.origin, update, (p) => ctx.waitUntil(p.catch((e) => console.error('bg', e && e.message))));
     } catch (e) {
       console.error('update error', (e && e.stack) || e);
     }
@@ -1502,9 +1545,9 @@ async function route(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
-      return await route(request, env);
+      return await route(request, env, ctx);
     } catch (e) {
       console.error('fatal', (e && e.stack) || e);
       return new Response('error', { status: 500 });
@@ -1515,6 +1558,7 @@ export default {
     ctx.waitUntil(
       (async () => {
         await ensureSchema(env);
+        try { await ea.cron(env); } catch (e) { console.error('eitaa cron error', (e && e.stack) || e); }
         await ensureWebhook(env);
       })().catch((e) => console.error('cron error', (e && e.stack) || e))
     );

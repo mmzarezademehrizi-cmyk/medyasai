@@ -1,11 +1,12 @@
 {
   "name": "cf-ai-telegram-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Commercial AI Telegram bot on Cloudflare Workers (Workers AI + D1)",
+  "description": "Commercial AI Telegram bot on Cloudflare Workers (Workers AI + D1) with an Eitaa module",
   "scripts": {
     "setup": "node setup.mjs",
+    "build:eitaa": "esbuild eitaa-src/entry.ts --bundle --format=esm --target=es2022 --outfile=src/eitaa.js",
     "test": "node test/worker.test.mjs && node test/setup.test.mjs"
   },
   "engines": { "node": ">=18" }

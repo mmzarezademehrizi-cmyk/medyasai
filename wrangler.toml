@@ -13,7 +13,7 @@ database_name = "ai-bot-db"
 database_id = "PUT-YOUR-D1-ID-HERE"
 
 [triggers]
-crons = ["*/2 * * * *"]
+crons = ["* * * * *"]
 
 [vars]
 OWNER_ID = "123456789"

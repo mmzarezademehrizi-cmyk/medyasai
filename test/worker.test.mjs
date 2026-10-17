@@ -38,6 +38,7 @@ const TINY_JPEG_B64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5, 0xff, 
 // ---------- global mocks ----------
 let tgCalls = [];
 let ddgMode = 'ok'; // ok | empty
+const eitaaCalls = [];
 globalThis.fetch = async (url, init = {}) => {
   url = String(url);
   if (url.startsWith('https://api.telegram.org/file/')) return new Response(new Uint8Array([1, 2, 3, 4, 5, 6]));
@@ -52,6 +53,15 @@ globalThis.fetch = async (url, init = {}) => {
     if (method === 'getWebhookInfo') return Response.json({ ok: true, result: { url: '' } });
     return Response.json({ ok: true, result: { message_id: 1 } });
   }
+  if (url.startsWith('https://eitaayar.ir/api/bot')) {
+    const method = url.split('/').pop();
+    let form = {};
+    if (init.body instanceof FormData) form = Object.fromEntries([...init.body.entries()].map(([k, v]) => [k, v instanceof Blob ? '<blob>' : v]));
+    eitaaCalls.push({ method, form });
+    if (method === 'getMe') return Response.json({ ok: true, result: { username: 'acc_eitaa' } });
+    return Response.json({ ok: true, result: { message_id: 77 } });
+  }
+  if (url.startsWith('https://eitaa.com')) return new Response('busy', { status: 503 });
   if (url.startsWith('https://html.duckduckgo.com')) return new Response(ddgMode === 'ok' ? DDG_HTML : '<html>anomaly</html>');
   if (url.startsWith('https://www.bing.com/search')) return new Response(BING_HTML);
   if (url.startsWith('https://example.com/article1')) return new Response(PAGE_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -424,6 +434,71 @@ test('/diag برای مالک گزارش می‌دهد', async () => {
   assert.match(rep, /✅ بینایی/);
   assert.match(rep, /✅ جستجوی وب/);
   assert.match(rep, /✅ ساخت تصویر/);
+});
+
+// ---------- ماژول ایتا ----------
+const OWNER = U(1000, 'Owner', 'owner');
+const cbq = async (data, from = OWNER) => {
+  const update = { update_id: ++uid, callback_query: { id: 'cb' + uid, from, data, message: { message_id: uid, chat: { id: from.id, type: 'private' }, date: 0 } } };
+  await worker.fetch(new Request('https://w.example.workers.dev/telegram', { method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'sec', 'content-type': 'application/json' }, body: JSON.stringify(update) }), env);
+};
+const texts = (id) => sent(id).map((c) => c.payload.text);
+
+test('ایتا: کاربر پلن‌رایگان اشتراک ندارد، مالک دارد', async () => {
+  reset();
+  await send({ text: '/eitaa' }, U(3999, 'Free', 'free'));
+  assert.ok(texts(3999).some((t) => t.includes('اشتراک فعال ندارید')), texts(3999).join('|'));
+  await send({ text: '/ai' }, U(3999, 'Free', 'free'));
+  reset();
+  await send({ text: '/eitaa' }, OWNER);
+  const w = sent(1000).find((c) => c.payload.reply_markup && c.payload.reply_markup.keyboard);
+  assert.ok(w && JSON.stringify(w.payload.reply_markup.keyboard).includes('بازگشت به هوش مصنوعی'));
+  assert.ok(w.payload.text.includes('از منوی پایین شروع کنید'));
+});
+
+test('ایتا: در حالت ایتا پیام‌ها به هوش مصنوعی نمی‌رسند؛ بازگشت کار می‌کند', async () => {
+  reset();
+  await send({ text: 'یک سوال معمولی' }, OWNER);
+  assert.equal(aiCalls.length, 0, JSON.stringify(aiCalls.map((c) => c.input.messages.slice(-1))));
+  assert.ok(texts(1000).some((t) => t.includes('از منوی پایین')));
+  reset();
+  await send({ text: '🔙 بازگشت به هوش مصنوعی' }, OWNER);
+  assert.ok(sent(1000).some((c) => c.payload.reply_markup && c.payload.reply_markup.remove_keyboard));
+  assert.equal(dbq("SELECT value FROM settings WHERE key='eamode:1000'").length, 0);
+  reset();
+  await send({ text: 'سلام، حالت عادی' }, OWNER);
+  assert.ok(aiCalls.length >= 1);
+});
+
+test('ایتا: توکن، کانال، پست زمان‌بندی، ایجنت، و ارسال با کران', async () => {
+  reset();
+  await send({ text: '/eitaa' }, OWNER);
+  await send({ text: '🔌 برنامه‌های متصل' }, OWNER);
+  await cbq('tk:set');
+
+  await send({ text: '12345:ABCDEFGH' }, OWNER);
+  assert.ok(texts(1000).some((t) => t.includes('توکن ایتایار ثبت شد')), JSON.stringify(eitaaCalls));
+  assert.equal(dbq('SELECT eitaa_account a FROM ea_users WHERE id=1000')[0].a, 'acc_eitaa');
+  assert.notEqual(dbq('SELECT eitaa_token_enc t FROM ea_users WHERE id=1000')[0].t, '12345:ABCDEFGH');
+  await send({ text: '📣 کانال‌ها' }, OWNER);
+  await cbq('ch:add');
+  await send({ text: '@mychannel' }, OWNER);
+  await send({ text: 'کانال من' }, OWNER).catch(() => {});
+  const ch = dbq('SELECT * FROM ea_channels WHERE user_id=1000');
+  assert.equal(ch.length, 1, texts(1000).join('|'));
+  // ایجنت: اجرای فوری با مدل شبیه‌سازی‌شده
+  env.DB.raw.prepare("INSERT INTO agent_jobs(user_id,channel_id,name,instruction,times,footer,approve,enabled,run_now,last_key,attempts,created_at) VALUES(1000,?,'t','یک متن کوتاه خودت بنویس','[]','🆔 @mychannel',0,1,1,'',0,0)").run(ch[0].id);
+  aiQueue.push({ choices: [{ message: { content: '', tool_calls: [{ id: 'a1', type: 'function', function: { name: 'post_to_channel', arguments: JSON.stringify({ text: 'روز خوش' }) } }] } }] });
+  reset();
+  aiQueue.push({ choices: [{ message: { content: '', tool_calls: [{ id: 'a1', type: 'function', function: { name: 'post_to_channel', arguments: JSON.stringify({ text: 'روز خوش' }) } }] } }] });
+  const run = async () => { const w = []; await worker.scheduled({}, env, { waitUntil: (p) => w.push(p) }); await Promise.all(w); };
+  await run();
+  const posts = dbq('SELECT * FROM ea_posts WHERE job_id IS NOT NULL');
+  assert.equal(posts.length, 1);
+  assert.ok(posts[0].text.endsWith('🆔 @mychannel') && posts[0].text.startsWith('روز خوش'));
+  await run();                                          // تیک بعدی پست آماده را تحویل می‌دهد
+  assert.equal(dbq('SELECT status s FROM ea_posts WHERE id=?', posts[0].id)[0].s, 'sent');
+  assert.ok(eitaaCalls.some((c) => c.method === 'sendMessage' && String(c.form.text).startsWith('روز خوش')));
 });
 
 // ---------- اجرا ----------

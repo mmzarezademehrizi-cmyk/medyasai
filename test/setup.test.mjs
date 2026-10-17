@@ -65,6 +65,7 @@ function startMock({ tgOk = true } = {}) {
       return res.end(JSON.stringify({ ok: true, result: [] }));
     }
     if (p === '/gh/repos/user/repo/contents/src/index.js') return res.end(CODE);
+    if (p === '/gh/repos/user/repo/contents/src/eitaa.js') return res.end(fs.readFileSync(path.join(ROOT, 'src/eitaa.js'), 'utf8'));
     if (p === '/gh/repos/user/repo/contents/schema.sql') return res.end(SCHEMA);
     res.statusCode = 404;
     res.end(JSON.stringify({ success: false, errors: [{ message: 'mock 404 ' + p }] }));
@@ -121,8 +122,8 @@ test('نصب کامل از GitHub (تلگرام در دسترس)', async () => {
   assert.match(b.WEBHOOK_SECRET.text, /^[A-Za-z0-9_-]{20,}$/);
   assert.ok(!b.BRAVE_API_KEY);
   assert.equal(m.log.boot, b.WEBHOOK_SECRET.text);
-  assert.equal(m.log.queries.length, 7);
-  assert.deepEqual(m.log.cron, [{ cron: '*/2 * * * *' }]);
+  assert.equal(m.log.queries.length, SCHEMA.split(/;\s*(?:\r?\n|$)/).map((s) => s.trim()).filter(Boolean).length);
+  assert.deepEqual(m.log.cron, [{ cron: '* * * * *' }]);
   assert.ok(fs.existsSync(path.join(ROOT, 'deploy-info.json')));
   const info = JSON.parse(fs.readFileSync(path.join(ROOT, 'deploy-info.json'), 'utf8'));
   assert.ok(!JSON.stringify(info).includes('111:AAA') && !JSON.stringify(info).includes('cf-token'));
