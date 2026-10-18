@@ -8,8 +8,7 @@ export interface LlmCfg { id: string; name: string; model: string; base?: string
 // Order = quality first. Names follow the Cloudflare Workers AI catalogue (verify with the "test" in the admin panel).
 export const MODELS: { model: string; name: string }[] = [
   { model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", name: "Llama 3.3 70B" },
-  { model: "@cf/mistralai/mistral-small-3.1-24b-instruct", name: "Mistral Small 3.1" },
-  { model: "@cf/meta/llama-3.1-8b-instruct", name: "Llama 3.1 8B" },
+  { model: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout" },
 ];
 
 let AI: Env["AI"];

@@ -572,6 +572,27 @@ test('ایتا: ایجنت پست عکس‌دار و ویدیویی را با ر
   assert.ok(String(files[0].form.caption).includes('عکس خبر'));
 });
 
+test('ایتا: آرگومان خراب مدل ترمیم می‌شود و ابزارها فرمت OpenAI دارند', async () => {
+  const { cleanArgs } = await import('../src/eitaa.js');
+  assert.equal(cleanArgs('{"channel": "abc"}{"x":1}'), '{"channel":"abc"}');
+  assert.equal(cleanArgs('{"a":"}"}  trailing'), '{"a":"}"}');
+  assert.equal(cleanArgs(''), '{}');
+  assert.equal(cleanArgs({ q: 1 }), '{"q":1}');
+  assert.equal(cleanArgs('نه JSON'), '{}');
+});
+
+test('ایتا: مدل اول خطا بدهد مدل بعدی جواب می‌دهد و خطای مدل منسوخ کنار می‌رود', async () => {
+  reset(); eitaaCalls.length = 0;
+  const chId = dbq('SELECT id FROM ea_channels WHERE user_id=1000')[0].id;
+  env.DB.raw.prepare('DELETE FROM agent_seen').run();
+  env.DB.raw.prepare("INSERT INTO agent_jobs(user_id,channel_id,name,instruction,times,footer,approve,enabled,run_now,last_key,attempts,created_at) VALUES(1000,?,'fb','یک متن کوتاه خودت بنویس','[]','🆔 @mychannel',0,1,1,'',0,0)").run(chId);
+  aiQueue.push(new Error('5028: @cf/x was deprecated on 2026-05-30'));
+  aiQueue.push({ response: '', tool_calls: [{ name: 'post_to_channel', arguments: { text: 'متن از مدل دوم' } }] });   // قالب بومی Workers AI
+  const w = []; await worker.scheduled({}, env, { waitUntil: (p) => w.push(p) }); await Promise.all(w);
+  const posts = dbq("SELECT text FROM ea_posts WHERE text LIKE 'متن از مدل دوم%'");
+  assert.equal(posts.length, 1);
+});
+
 // ---------- اجرا ----------
 let failed = 0;
 for (const [name, fn] of tests) {

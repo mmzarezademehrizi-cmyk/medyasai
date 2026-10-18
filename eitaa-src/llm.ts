@@ -17,23 +17,52 @@ export function httpReason(status: number): string {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** One request to one provider. Throws Error(reason) on any failure; retries once on 429/5xx. */
+/** Valid, canonical JSON arguments from whatever a model produced (a string, an object, or a string with extra text after the object). */
+export function cleanArgs(raw: unknown): string {
+  if (raw && typeof raw === "object") return JSON.stringify(raw);
+  const s = String(raw ?? "").trim();
+  if (!s) return "{}";
+  try { const v = JSON.parse(s); return JSON.stringify(v && typeof v === "object" ? v : {}); } catch { /* fall through */ }
+  const start = s.indexOf("{");
+  if (start >= 0) {                                  // first balanced {...} (strings respected)
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+      if (ch === '"') inStr = true; else if (ch === "{") depth++; else if (ch === "}" && --depth === 0) { try { return JSON.stringify(JSON.parse(s.slice(start, i + 1))); } catch { break; } }
+    }
+  }
+  return "{}";
+}
+
 /** Workers AI through the Worker's own binding (no key). Output is converted to the OpenAI chat-completions shape. */
 async function viaBinding(cfg: LlmCfg, body: Record<string, unknown>): Promise<any> {
   const ai = getAi();
   if (!ai) throw new Error("اتصال Workers AI (binding) فعال نیست");
-  const msgs = (body.messages as ChatMsg[]).map((m) => m.tool_calls
-    ? { role: "assistant", content: m.content || "", tool_calls: m.tool_calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } })) }
+  const all = body.messages as ChatMsg[];
+  const nameOf = new Map<string, string>(all.flatMap((m) => (m.tool_calls || []).map((c) => [c.id, c.function.name] as [string, string])));
+  const msgs = all.map((m) => m.tool_calls
+    ? { role: "assistant", content: m.content || "", tool_calls: m.tool_calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: cleanArgs(c.function.arguments) } })) }
+    : m.role === "tool" ? { role: "tool", tool_call_id: m.tool_call_id, name: nameOf.get(m.tool_call_id || "") || m.name || "tool", content: String(m.content ?? "") }
     : m);
+  const run = (tools?: unknown) => ai.run(cfg.model, { messages: msgs, max_tokens: body.max_tokens, temperature: body.temperature, ...(tools ? { tools } : {}) });
   let r: any;
-  try { r = await ai.run(cfg.model, { messages: msgs, max_tokens: body.max_tokens, temperature: body.temperature, ...(body.tools ? { tools: (body.tools as ToolDef[]).map((t) => t.function) } : {}) }); }
-  catch (e) {
+  try {
+    try { r = await run(body.tools); }                                                         // OpenAI-style tools (what current models expect)
+    catch (e) {
+      if (!body.tools || !/tools|function/i.test(String((e as Error).message)) || /8007.*arguments/i.test(String((e as Error).message))) throw e;
+      r = await run((body.tools as ToolDef[]).map((t) => t.function));                         // older models want the bare function objects
+    }
+  } catch (e) {
     const t = String((e as Error).message || e);
-    throw Object.assign(new Error(/limit|quota|neurons|capacity|4006|allocation/i.test(t) ? httpReason(429) : `Workers AI: ${t.slice(0, 120)}`), /limit|quota|neurons|capacity|4006|allocation/i.test(t) ? { status: 429 } : {});
+    const quota = /limit|quota|neurons|capacity|4006|allocation/i.test(t);
+    throw Object.assign(new Error(quota ? httpReason(429) : `Workers AI: ${t.slice(0, 120)}`), quota ? { status: 429 } : /deprecated|5028|not found|no such model/i.test(t) ? { status: 404 } : {});
   }
   if (r?.choices?.[0]?.message) return r;
-  const calls = (r?.tool_calls || []).map((c: any, i: number) => ({ id: `cf_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.name, arguments: typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments || {}) } }));
-  return { choices: [{ message: { role: "assistant", content: typeof r?.response === "string" ? r.response.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : null, ...(calls.length ? { tool_calls: calls } : {}) } }] };
+  const rawCalls = r?.tool_calls || r?.result?.tool_calls || [];
+  const calls = rawCalls.map((c: any, i: number) => ({ id: c.id || `cf_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.name || c.function?.name, arguments: cleanArgs(c.arguments ?? c.function?.arguments) } }));
+  const text = r?.response ?? r?.result?.response;
+  return { choices: [{ message: { role: "assistant", content: typeof text === "string" ? text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : null, ...(calls.length ? { tool_calls: calls } : {}) } }] };
 }
 
 export async function callOne(cfg: LlmCfg, body: Record<string, unknown>, timeoutMs = 45_000): Promise<any> {
@@ -72,6 +101,7 @@ async function viaChain<T>(env: Env, fn: (cfg: LlmCfg) => Promise<T>): Promise<T
       errs.push(`${cfg.name}: ${(e as Error).message}`);
       const st = (e as { status?: number }).status;   // quota / balance / key problems: don't hammer this provider again for a while
       if (st === 429) await markCooldown(env, cfg.id, 10 * 60).catch(() => {});
+      else if (st === 404) await markCooldown(env, cfg.id, 6 * 3600).catch(() => {});   // retired/renamed model
       else if (st === 402 || st === 401 || st === 403) await markCooldown(env, cfg.id, 30 * 60).catch(() => {});
       else if (st && st >= 500) await markCooldown(env, cfg.id, 2 * 60).catch(() => {});
     }
@@ -100,7 +130,7 @@ export function chatTools(env: Env, messages: ChatMsg[], tools: ToolDef[], timeo
     const j = await callOne(cfg, { temperature: 0.3, max_tokens: maxTokens, messages: msgs, tools, tool_choice: "auto" }, timeoutMs);
     const m = j?.choices?.[0]?.message;
     if (!m) throw new Error("پاسخ نامعتبر");
-    const calls = (m.tool_calls || []).map((c: any, i: number) => ({ ...c, id: c.id || `call_${Date.now().toString(36)}_${i}`, type: "function" }));
-    return { role: "assistant", content: m.content ?? null, ...(calls.length ? { tool_calls: calls } : {}) } as ChatMsg;
+    const calls = (m.tool_calls || []).filter((c: any) => (c.function?.name || c.name)).map((c: any, i: number) => ({ id: c.id || `call_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.function?.name || c.name, arguments: cleanArgs(c.function?.arguments ?? c.arguments) } }));
+    return { role: "assistant", content: typeof m.content === "string" ? m.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : null, ...(calls.length ? { tool_calls: calls } : {}) } as ChatMsg;
   });
 }

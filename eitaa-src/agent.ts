@@ -226,9 +226,10 @@ const AD_RE = /تبلیغ|قرعه.?کشی|جایزه|تخفیف|فروش ویژ
 const STOP = new Set("از در به با که را این آن برای و یا هر روز ساعت صبح ظهر شب کانال کانالم کانال‌های مطلب مطالب پست بیاور بگذار بذار بگیر درباره مفید باشد نباشد تبلیغ امروز تاریخ همان دقیقا دقیقاً چند یک دو سه بار بعد قبل خودت بنویس".split(/\s+/));
 const words = (t: string) => normDigits(t).replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w));
 
-async function heuristicRun(env: Env, j: JobRow, t: number): Promise<RunResult> {
+async function heuristicRun(env: Env, j: JobRow, t: number, why = ""): Promise<RunResult> {
+  const lead = /سهمیه|نیمه‌شب|محدود/.test(why) || !why ? "سهمیه‌ی هوش مصنوعی تمام بود" : `هوش مصنوعی خطا داد (${why.replace(/\s+/g, " ").slice(0, 160)})`;
   const instr = j.instruction, srcs = [...new Set([...instr.matchAll(/@([A-Za-z0-9_.]{3,64})/g)].map((m) => m[1]))].filter((c) => c.toLowerCase() !== "").slice(0, MAX_CHANNELS_PER_RUN);
-  if (!srcs.length) return { summary: "سهمیه‌ی هوش مصنوعی امروز تمام شده و این کار منبع مشخصی ندارد؛ فردا یا با دکمه‌ی «اجرا الان» دوباره تلاش می‌شود.", posts: 0, retryMin: null, error: true };
+  if (!srcs.length) return { summary: `${lead} و این کار منبع مشخصی (@کانال) ندارد که با قوانین ساده انجام شود.`, posts: 0, retryMin: null, error: true };
   const nm = normDigits(instr).match(/(\d)\s*(?:تا)?\s*(?:مطلب|پست|خبر|مورد)/), want = Math.min(nm ? +nm[1] : 1, 3);
   const needDate = /تاریخ/.test(instr), topic = new Set(words(instr.replace(/@\S+/g, "")));
   const st: ReadState = { channels: new Map(), refs: new Map() };
@@ -261,7 +262,7 @@ async function heuristicRun(env: Env, j: JobRow, t: number): Promise<RunResult> 
     if (draft) await tg.send(env, j.user_id, `📝 <b>پیش‌نویس ایجنت «${esc(j.name)}»</b> (#${ids[0]})${q.kind !== "none" ? (q.kind === "video" ? " 🎬" : " 🖼") : ""}\n\n${esc(q.text.slice(0, 1500))}`, ikb([[["✅ انتشار", `ag:go:${ids[0]}`], ["🗑 حذف", `ag:no:${ids[0]}`]]] as Btn[][]));
     n++;
   }
-  return { summary: n ? `سهمیه‌ی هوش مصنوعی تمام بود؛ با موتور قانون‌محور ${n} پست انتخاب شد.` : "سهمیه‌ی هوش مصنوعی تمام بود و مطلب مناسبی با قوانین ساده پیدا نشد.", posts: n, retryMin: null };
+  return { summary: n ? `${lead}؛ با موتور قانون‌محور ${n} پست انتخاب شد.` : `${lead} و مطلب مناسبی هم با قوانین ساده پیدا نشد.`, posts: n, retryMin: null };
 }
 
 async function runAgent(env: Env, j: JobRow, slot: Slot, final: boolean): Promise<RunResult> {
@@ -321,7 +322,7 @@ async function runAgent(env: Env, j: JobRow, slot: Slot, final: boolean): Promis
     let m: ChatMsg;
     try { m = await chatTools(env, messages, tools, 45_000, 900); }
     catch (e) {
-      if (step === 0 && !state.posts) return heuristicRun(env, j, t);      // every model failed (quota/outage): do the job with plain rules
+      if (!state.posts) return heuristicRun(env, j, t, (e as Error).message);      // every model failed (quota/outage): do the job with plain rules
       throw e;
     }
     messages.push(m);

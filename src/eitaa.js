@@ -317,8 +317,7 @@ async function lookupChat(env, chatId) {
 // eitaa-src/providers.ts
 var MODELS = [
   { model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", name: "Llama 3.3 70B" },
-  { model: "@cf/mistralai/mistral-small-3.1-24b-instruct", name: "Mistral Small 3.1" },
-  { model: "@cf/meta/llama-3.1-8b-instruct", name: "Llama 3.1 8B" }
+  { model: "@cf/meta/llama-4-scout-17b-16e-instruct", name: "Llama 4 Scout" }
 ];
 var AI;
 var getAi = () => AI;
@@ -355,20 +354,64 @@ function httpReason(status) {
   return `\u062E\u0637\u0627\u06CC HTTP ${status}`;
 }
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function cleanArgs(raw) {
+  if (raw && typeof raw === "object") return JSON.stringify(raw);
+  const s = String(raw ?? "").trim();
+  if (!s) return "{}";
+  try {
+    const v = JSON.parse(s);
+    return JSON.stringify(v && typeof v === "object" ? v : {});
+  } catch {
+  }
+  const start2 = s.indexOf("{");
+  if (start2 >= 0) {
+    let depth = 0, inStr = false, esc2 = false;
+    for (let i = start2; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) {
+        if (esc2) esc2 = false;
+        else if (ch === "\\") esc2 = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}" && --depth === 0) {
+        try {
+          return JSON.stringify(JSON.parse(s.slice(start2, i + 1)));
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  return "{}";
+}
 async function viaBinding(cfg, body) {
   const ai = getAi();
   if (!ai) throw new Error("\u0627\u062A\u0635\u0627\u0644 Workers AI (binding) \u0641\u0639\u0627\u0644 \u0646\u06CC\u0633\u062A");
-  const msgs = body.messages.map((m) => m.tool_calls ? { role: "assistant", content: m.content || "", tool_calls: m.tool_calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } })) } : m);
+  const all = body.messages;
+  const nameOf = new Map(all.flatMap((m) => (m.tool_calls || []).map((c) => [c.id, c.function.name])));
+  const msgs = all.map((m) => m.tool_calls ? { role: "assistant", content: m.content || "", tool_calls: m.tool_calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: cleanArgs(c.function.arguments) } })) } : m.role === "tool" ? { role: "tool", tool_call_id: m.tool_call_id, name: nameOf.get(m.tool_call_id || "") || m.name || "tool", content: String(m.content ?? "") } : m);
+  const run = (tools) => ai.run(cfg.model, { messages: msgs, max_tokens: body.max_tokens, temperature: body.temperature, ...tools ? { tools } : {} });
   let r;
   try {
-    r = await ai.run(cfg.model, { messages: msgs, max_tokens: body.max_tokens, temperature: body.temperature, ...body.tools ? { tools: body.tools.map((t) => t.function) } : {} });
+    try {
+      r = await run(body.tools);
+    } catch (e) {
+      if (!body.tools || !/tools|function/i.test(String(e.message)) || /8007.*arguments/i.test(String(e.message))) throw e;
+      r = await run(body.tools.map((t) => t.function));
+    }
   } catch (e) {
     const t = String(e.message || e);
-    throw Object.assign(new Error(/limit|quota|neurons|capacity|4006|allocation/i.test(t) ? httpReason(429) : `Workers AI: ${t.slice(0, 120)}`), /limit|quota|neurons|capacity|4006|allocation/i.test(t) ? { status: 429 } : {});
+    const quota = /limit|quota|neurons|capacity|4006|allocation/i.test(t);
+    throw Object.assign(new Error(quota ? httpReason(429) : `Workers AI: ${t.slice(0, 120)}`), quota ? { status: 429 } : /deprecated|5028|not found|no such model/i.test(t) ? { status: 404 } : {});
   }
   if (r?.choices?.[0]?.message) return r;
-  const calls = (r?.tool_calls || []).map((c, i) => ({ id: `cf_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.name, arguments: typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments || {}) } }));
-  return { choices: [{ message: { role: "assistant", content: typeof r?.response === "string" ? r.response.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : null, ...calls.length ? { tool_calls: calls } : {} } }] };
+  const rawCalls = r?.tool_calls || r?.result?.tool_calls || [];
+  const calls = rawCalls.map((c, i) => ({ id: c.id || `cf_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.name || c.function?.name, arguments: cleanArgs(c.arguments ?? c.function?.arguments) } }));
+  const text = r?.response ?? r?.result?.response;
+  return { choices: [{ message: { role: "assistant", content: typeof text === "string" ? text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : null, ...calls.length ? { tool_calls: calls } : {} } }] };
 }
 async function callOne(cfg, body, timeoutMs = 45e3) {
   if (!cfg.base) return viaBinding(cfg, body);
@@ -417,6 +460,8 @@ async function viaChain(env, fn) {
       const st = e.status;
       if (st === 429) await markCooldown(env, cfg.id, 10 * 60).catch(() => {
       });
+      else if (st === 404) await markCooldown(env, cfg.id, 6 * 3600).catch(() => {
+      });
       else if (st === 402 || st === 401 || st === 403) await markCooldown(env, cfg.id, 30 * 60).catch(() => {
       });
       else if (st && st >= 500) await markCooldown(env, cfg.id, 2 * 60).catch(() => {
@@ -449,8 +494,8 @@ function chatTools(env, messages, tools, timeoutMs = 45e3, maxTokens = 900) {
     const j = await callOne(cfg, { temperature: 0.3, max_tokens: maxTokens, messages: msgs, tools, tool_choice: "auto" }, timeoutMs);
     const m = j?.choices?.[0]?.message;
     if (!m) throw new Error("\u067E\u0627\u0633\u062E \u0646\u0627\u0645\u0639\u062A\u0628\u0631");
-    const calls = (m.tool_calls || []).map((c, i) => ({ ...c, id: c.id || `call_${Date.now().toString(36)}_${i}`, type: "function" }));
-    return { role: "assistant", content: m.content ?? null, ...calls.length ? { tool_calls: calls } : {} };
+    const calls = (m.tool_calls || []).filter((c) => c.function?.name || c.name).map((c, i) => ({ id: c.id || `call_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.function?.name || c.name, arguments: cleanArgs(c.function?.arguments ?? c.arguments) } }));
+    return { role: "assistant", content: typeof m.content === "string" ? m.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : null, ...calls.length ? { tool_calls: calls } : {} };
   });
 }
 
@@ -925,9 +970,10 @@ var TOOLS = (final) => [
 var AD_RE = /تبلیغ|قرعه.?کشی|جایزه|تخفیف|فروش ویژه|ثبت.?نام|سفارش|خرید|کد تخفیف|عضو شوید|لینک عضویت|join|https?:\/\/t\.me|بنر/i;
 var STOP = new Set("\u0627\u0632 \u062F\u0631 \u0628\u0647 \u0628\u0627 \u06A9\u0647 \u0631\u0627 \u0627\u06CC\u0646 \u0622\u0646 \u0628\u0631\u0627\u06CC \u0648 \u06CC\u0627 \u0647\u0631 \u0631\u0648\u0632 \u0633\u0627\u0639\u062A \u0635\u0628\u062D \u0638\u0647\u0631 \u0634\u0628 \u06A9\u0627\u0646\u0627\u0644 \u06A9\u0627\u0646\u0627\u0644\u0645 \u06A9\u0627\u0646\u0627\u0644\u200C\u0647\u0627\u06CC \u0645\u0637\u0644\u0628 \u0645\u0637\u0627\u0644\u0628 \u067E\u0633\u062A \u0628\u06CC\u0627\u0648\u0631 \u0628\u06AF\u0630\u0627\u0631 \u0628\u0630\u0627\u0631 \u0628\u06AF\u06CC\u0631 \u062F\u0631\u0628\u0627\u0631\u0647 \u0645\u0641\u06CC\u062F \u0628\u0627\u0634\u062F \u0646\u0628\u0627\u0634\u062F \u062A\u0628\u0644\u06CC\u063A \u0627\u0645\u0631\u0648\u0632 \u062A\u0627\u0631\u06CC\u062E \u0647\u0645\u0627\u0646 \u062F\u0642\u06CC\u0642\u0627 \u062F\u0642\u06CC\u0642\u0627\u064B \u0686\u0646\u062F \u06CC\u06A9 \u062F\u0648 \u0633\u0647 \u0628\u0627\u0631 \u0628\u0639\u062F \u0642\u0628\u0644 \u062E\u0648\u062F\u062A \u0628\u0646\u0648\u06CC\u0633".split(/\s+/));
 var words = (t) => normDigits(t).replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w));
-async function heuristicRun(env, j, t) {
+async function heuristicRun(env, j, t, why = "") {
+  const lead = /سهمیه|نیمه‌شب|محدود/.test(why) || !why ? "\u0633\u0647\u0645\u06CC\u0647\u200C\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062A\u0645\u0627\u0645 \u0628\u0648\u062F" : `\u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062E\u0637\u0627 \u062F\u0627\u062F (${why.replace(/\s+/g, " ").slice(0, 160)})`;
   const instr = j.instruction, srcs = [...new Set([...instr.matchAll(/@([A-Za-z0-9_.]{3,64})/g)].map((m) => m[1]))].filter((c) => c.toLowerCase() !== "").slice(0, MAX_CHANNELS_PER_RUN);
-  if (!srcs.length) return { summary: "\u0633\u0647\u0645\u06CC\u0647\u200C\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u0627\u0645\u0631\u0648\u0632 \u062A\u0645\u0627\u0645 \u0634\u062F\u0647 \u0648 \u0627\u06CC\u0646 \u06A9\u0627\u0631 \u0645\u0646\u0628\u0639 \u0645\u0634\u062E\u0635\u06CC \u0646\u062F\u0627\u0631\u062F\u061B \u0641\u0631\u062F\u0627 \u06CC\u0627 \u0628\u0627 \u062F\u06A9\u0645\u0647\u200C\u06CC \xAB\u0627\u062C\u0631\u0627 \u0627\u0644\u0627\u0646\xBB \u062F\u0648\u0628\u0627\u0631\u0647 \u062A\u0644\u0627\u0634 \u0645\u06CC\u200C\u0634\u0648\u062F.", posts: 0, retryMin: null, error: true };
+  if (!srcs.length) return { summary: `${lead} \u0648 \u0627\u06CC\u0646 \u06A9\u0627\u0631 \u0645\u0646\u0628\u0639 \u0645\u0634\u062E\u0635\u06CC (@\u06A9\u0627\u0646\u0627\u0644) \u0646\u062F\u0627\u0631\u062F \u06A9\u0647 \u0628\u0627 \u0642\u0648\u0627\u0646\u06CC\u0646 \u0633\u0627\u062F\u0647 \u0627\u0646\u062C\u0627\u0645 \u0634\u0648\u062F.`, posts: 0, retryMin: null, error: true };
   const nm = normDigits(instr).match(/(\d)\s*(?:تا)?\s*(?:مطلب|پست|خبر|مورد)/), want = Math.min(nm ? +nm[1] : 1, 3);
   const needDate = /تاریخ/.test(instr), topic = new Set(words(instr.replace(/@\S+/g, "")));
   const st = { channels: /* @__PURE__ */ new Map(), refs: /* @__PURE__ */ new Map() };
@@ -962,7 +1008,7 @@ async function heuristicRun(env, j, t) {
 ${esc(q.text.slice(0, 1500))}`, ikb([[["\u2705 \u0627\u0646\u062A\u0634\u0627\u0631", `ag:go:${ids[0]}`], ["\u{1F5D1} \u062D\u0630\u0641", `ag:no:${ids[0]}`]]]));
     n++;
   }
-  return { summary: n ? `\u0633\u0647\u0645\u06CC\u0647\u200C\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062A\u0645\u0627\u0645 \u0628\u0648\u062F\u061B \u0628\u0627 \u0645\u0648\u062A\u0648\u0631 \u0642\u0627\u0646\u0648\u0646\u200C\u0645\u062D\u0648\u0631 ${n} \u067E\u0633\u062A \u0627\u0646\u062A\u062E\u0627\u0628 \u0634\u062F.` : "\u0633\u0647\u0645\u06CC\u0647\u200C\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062A\u0645\u0627\u0645 \u0628\u0648\u062F \u0648 \u0645\u0637\u0644\u0628 \u0645\u0646\u0627\u0633\u0628\u06CC \u0628\u0627 \u0642\u0648\u0627\u0646\u06CC\u0646 \u0633\u0627\u062F\u0647 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.", posts: n, retryMin: null };
+  return { summary: n ? `${lead}\u061B \u0628\u0627 \u0645\u0648\u062A\u0648\u0631 \u0642\u0627\u0646\u0648\u0646\u200C\u0645\u062D\u0648\u0631 ${n} \u067E\u0633\u062A \u0627\u0646\u062A\u062E\u0627\u0628 \u0634\u062F.` : `${lead} \u0648 \u0645\u0637\u0644\u0628 \u0645\u0646\u0627\u0633\u0628\u06CC \u0647\u0645 \u0628\u0627 \u0642\u0648\u0627\u0646\u06CC\u0646 \u0633\u0627\u062F\u0647 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.`, posts: n, retryMin: null };
 }
 async function runAgent(env, j, slot, final) {
   const ch = await getChannel(env, j.channel_id);
@@ -1025,7 +1071,7 @@ ${esc(p.text.slice(0, 1500))}`, ikb([[["\u2705 \u0627\u0646\u062A\u0634\u0627\u0
     try {
       m = await chatTools(env, messages, tools, 45e3, 900);
     } catch (e) {
-      if (step === 0 && !state.posts) return heuristicRun(env, j, t);
+      if (!state.posts) return heuristicRun(env, j, t, e.message);
       throw e;
     }
     messages.push(m);
@@ -1958,6 +2004,7 @@ async function cron(host) {
 export {
   SCHEMA,
   adapt,
+  cleanArgs,
   cron,
   ensureSchema,
   handle,
